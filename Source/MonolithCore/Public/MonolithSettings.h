@@ -257,6 +257,11 @@ public:
 			  ToolTip="Registers level_sequence_query actions for Level Sequence Director Blueprint introspection (director functions, variables, event-track bindings to director functions, cross-sequence reverse lookup of function callers)."))
 	bool bEnableLevelSequence = true;
 
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable PCG Module",
+			  ToolTip="Registers pcg_query actions for Procedural Content Generation graph creation, node management, and runtime generation. Requires PCG plugin (engine-bundled)."))
+	bool bEnablePCG = true;
+
 	// --- Modules|Mesh ---
 
 	UPROPERTY(config, EditAnywhere, Category="Modules|Mesh",

@@ -28,6 +28,10 @@
 			"Enabled": true
 		},
 		{
+			"Name": "PCG",
+			"Enabled": true
+		},
+		{
 			"Name": "EditorScriptingUtilities",
 			"Enabled": true
 		},
@@ -218,6 +222,11 @@
 		},
 		{
 			"Name": "MonolithLevelSequence",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithPCG",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
 		}
