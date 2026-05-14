@@ -48,6 +48,41 @@ static FString GetAssetPath(const TSharedPtr<FJsonObject>& Params)
 	return Params->GetStringField(TEXT("asset_path"));
 }
 
+static UClass* ResolveObjectParameterClass(const FString& ClassName)
+{
+	if (ClassName.IsEmpty())
+	{
+		return UObject::StaticClass();
+	}
+
+	if (UClass* Class = LoadObject<UClass>(nullptr, *ClassName))
+	{
+		return Class;
+	}
+
+	if (UClass* Class = FindFirstObjectSafe<UClass>(*ClassName))
+	{
+		return Class;
+	}
+
+	const FString UPrefixedName = ClassName.StartsWith(TEXT("U")) ? ClassName : FString::Printf(TEXT("U%s"), *ClassName);
+	if (UClass* Class = FindFirstObjectSafe<UClass>(*UPrefixedName))
+	{
+		return Class;
+	}
+
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		if (It->GetName().Equals(ClassName, ESearchCase::IgnoreCase) ||
+			It->GetName().Equals(UPrefixedName, ESearchCase::IgnoreCase))
+		{
+			return *It;
+		}
+	}
+
+	return nullptr;
+}
+
 // ============================================================================
 // Internal Helpers
 // ============================================================================
@@ -290,7 +325,8 @@ void FMonolithPCGActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PCG graph asset path"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Parameter name"))
 			.Required(TEXT("value"), TEXT("string"), TEXT("Parameter value as string"))
-			.Optional(TEXT("type"), TEXT("string"), TEXT("Type for new params: Bool, Byte, Int32, Int64, Float, Double, Name, String, Text"), TEXT("Double"))
+			.Optional(TEXT("type"), TEXT("string"), TEXT("Type for new params: Bool, Byte, Int32, Int64, Float, Double, Name, String, Text, Object"), TEXT("Double"))
+			.Optional(TEXT("object_class"), TEXT("string"), TEXT("Class for Object params, e.g. StaticMesh or /Script/Engine.StaticMesh"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("pcg"), TEXT("remove_graph_parameter"), TEXT("Remove a user-defined graph parameter by name"),
@@ -893,6 +929,8 @@ FMonolithActionResult FMonolithPCGActions::HandleSetGraphParameter(const TShared
 	FString ParamName = Params->GetStringField(TEXT("name"));
 	FString Value = Params->GetStringField(TEXT("value"));
 	FString TypeStr = Params->GetStringField(TEXT("type"));
+	FString ObjectClassName;
+	Params->TryGetStringField(TEXT("object_class"), ObjectClassName);
 
 	if (AssetPath.IsEmpty() || ParamName.IsEmpty())
 	{
@@ -927,6 +965,7 @@ FMonolithActionResult FMonolithPCGActions::HandleSetGraphParameter(const TShared
 	{
 		// Resolve type string to EPropertyBagPropertyType
 		EPropertyBagPropertyType BagType = EPropertyBagPropertyType::Double; // default
+		UObject* ValueTypeObject = nullptr;
 
 		if (!TypeStr.IsEmpty())
 		{
@@ -939,10 +978,19 @@ FMonolithActionResult FMonolithPCGActions::HandleSetGraphParameter(const TShared
 			else if (TypeStr.Equals(TEXT("Name"), ESearchCase::IgnoreCase)) BagType = EPropertyBagPropertyType::Name;
 			else if (TypeStr.Equals(TEXT("String"), ESearchCase::IgnoreCase)) BagType = EPropertyBagPropertyType::String;
 			else if (TypeStr.Equals(TEXT("Text"), ESearchCase::IgnoreCase)) BagType = EPropertyBagPropertyType::Text;
+			else if (TypeStr.Equals(TEXT("Object"), ESearchCase::IgnoreCase))
+			{
+				BagType = EPropertyBagPropertyType::Object;
+				ValueTypeObject = ResolveObjectParameterClass(ObjectClassName);
+				if (!ValueTypeObject)
+				{
+					return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to resolve object_class '%s'"), *ObjectClassName));
+				}
+			}
 		}
 
 		TArray<FPropertyBagPropertyDesc> NewDescs;
-		NewDescs.Add(FPropertyBagPropertyDesc(PropName, BagType));
+		NewDescs.Add(FPropertyBagPropertyDesc(PropName, BagType, ValueTypeObject));
 		EPropertyBagAlterationResult AddResult = Graph->AddUserParameters(NewDescs);
 		if (AddResult != EPropertyBagAlterationResult::Success)
 		{
