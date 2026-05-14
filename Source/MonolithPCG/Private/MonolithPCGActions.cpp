@@ -325,7 +325,7 @@ void FMonolithPCGActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PCG graph asset path"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Parameter name"))
 			.Required(TEXT("value"), TEXT("string"), TEXT("Parameter value as string"))
-			.Optional(TEXT("type"), TEXT("string"), TEXT("Type for new params: Bool, Byte, Int32, Int64, Float, Double, Name, String, Text, Object"), TEXT("Double"))
+			.Optional(TEXT("type"), TEXT("string"), TEXT("Type for new params: Bool, Byte, Int32, Int64, Float, Double, Name, String, Text, Object, Vector"), TEXT("Double"))
 			.Optional(TEXT("object_class"), TEXT("string"), TEXT("Class for Object params, e.g. StaticMesh or /Script/Engine.StaticMesh"))
 			.Build());
 
@@ -978,6 +978,11 @@ FMonolithActionResult FMonolithPCGActions::HandleSetGraphParameter(const TShared
 			else if (TypeStr.Equals(TEXT("Name"), ESearchCase::IgnoreCase)) BagType = EPropertyBagPropertyType::Name;
 			else if (TypeStr.Equals(TEXT("String"), ESearchCase::IgnoreCase)) BagType = EPropertyBagPropertyType::String;
 			else if (TypeStr.Equals(TEXT("Text"), ESearchCase::IgnoreCase)) BagType = EPropertyBagPropertyType::Text;
+			else if (TypeStr.Equals(TEXT("Vector"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("FVector"), ESearchCase::IgnoreCase))
+			{
+				BagType = EPropertyBagPropertyType::Struct;
+				ValueTypeObject = TBaseStructure<FVector>::Get();
+			}
 			else if (TypeStr.Equals(TEXT("Object"), ESearchCase::IgnoreCase))
 			{
 				BagType = EPropertyBagPropertyType::Object;
