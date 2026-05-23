@@ -38,6 +38,12 @@
 #include "NiagaraCommon.h"
 #include "EdGraphSchema_Niagara.h"
 #include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
+#include "ViewModels/NiagaraSystemViewModel.h"
+#include "ViewModels/Stack/NiagaraStackViewModel.h"
+#include "ViewModels/Stack/NiagaraStackEntry.h"
+#include "ViewModels/Stack/NiagaraStackModuleItem.h"
+#include "ViewModels/Stack/NiagaraStackFunctionInput.h"
+#include "UObject/StructOnScope.h"
 #include "NiagaraParameterMapHistory.h"
 #include "NiagaraSystemEditorData.h"
 #include "NiagaraScriptVariable.h"
@@ -74,6 +80,78 @@ DEFINE_LOG_CATEGORY_STATIC(LogMonolithNiagara, Log, All);
 
 namespace MonolithNiagaraHelpers
 {
+	struct FStackLocalValueWriteResult
+	{
+		bool bSuccess = false;
+		bool bUsedStackInput = false;
+		bool bUsedRapidIteration = false;
+		bool bUsedDirectRapidIteration = false;
+		FString Error;
+		FString WrittenValue;
+	};
+
+	FString NormalizeEnumMatchString(const FString& Value)
+	{
+		FString Normalized;
+		Normalized.Reserve(Value.Len());
+		for (const TCHAR Ch : Value)
+		{
+			if (!FChar::IsWhitespace(Ch))
+			{
+				Normalized.AppendChar(Ch);
+			}
+		}
+		return Normalized;
+	}
+
+	bool TryNormalizeStaticSwitchValue(const FNiagaraTypeDefinition& InputType, const FString& RequestedValue, FString& OutInternalValue, FString& OutError)
+	{
+		OutInternalValue = RequestedValue;
+
+		UEnum* Enum = InputType.GetEnum();
+		if (Enum == nullptr)
+		{
+			return true;
+		}
+
+		if (Enum->GetIndexByNameString(RequestedValue) != INDEX_NONE)
+		{
+			return true;
+		}
+
+		const FString RequestedComparable = NormalizeEnumMatchString(RequestedValue);
+		TArray<FString> ValidValues;
+		for (int32 EnumIndex = 0; EnumIndex < Enum->NumEnums(); ++EnumIndex)
+		{
+			const FString InternalName = Enum->GetNameStringByIndex(EnumIndex);
+			if (InternalName.IsEmpty())
+			{
+				continue;
+			}
+
+			const FString DisplayName = Enum->GetDisplayNameTextByIndex(EnumIndex).ToString();
+			ValidValues.Add(FString::Printf(TEXT("%s (%s)"), *InternalName, DisplayName.IsEmpty() ? TEXT("<no display name>") : *DisplayName));
+
+			if (!DisplayName.IsEmpty())
+			{
+				const FString DisplayComparable = NormalizeEnumMatchString(DisplayName);
+				if (DisplayName.Equals(RequestedValue, ESearchCase::IgnoreCase) ||
+					DisplayComparable.Equals(RequestedComparable, ESearchCase::IgnoreCase))
+				{
+					OutInternalValue = InternalName;
+					return true;
+				}
+			}
+		}
+
+		OutError = FString::Printf(
+			TEXT("Enum value '%s' not found for '%s'. Valid values: [%s]"),
+			*RequestedValue,
+			*InputType.GetName(),
+			*FString::Join(ValidValues, TEXT(", ")));
+		return false;
+	}
+
 	// Helper: find the ParameterMap pin on a node (matches engine's GetParameterMapPin logic)
 	UEdGraphPin* GetParameterMapPin(UNiagaraNode& Node, EEdGraphPinDirection Direction)
 	{
@@ -263,6 +341,671 @@ namespace MonolithNiagaraHelpers
 		}
 		return FullName;
 	}
+
+	FString LocalJsonValueToString(const TSharedPtr<FJsonValue>& Value)
+	{
+		if (!Value.IsValid())
+		{
+			return FString();
+		}
+		if (Value->Type == EJson::String)
+		{
+			return FString::Printf(TEXT("\"%s\""), *Value->AsString());
+		}
+		if (Value->Type == EJson::Number)
+		{
+			return FString::SanitizeFloat(Value->AsNumber());
+		}
+		if (Value->Type == EJson::Boolean)
+		{
+			return Value->AsBool() ? TEXT("true") : TEXT("false");
+		}
+		if (Value->Type == EJson::Object)
+		{
+			TSharedPtr<FJsonObject> ObjectValue = Value->AsObject();
+			if (ObjectValue.IsValid())
+			{
+				FString Result;
+				TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Result);
+				FJsonSerializer::Serialize(ObjectValue.ToSharedRef(), Writer);
+				return Result;
+			}
+		}
+		if (Value->Type == EJson::Array)
+		{
+			FString Result;
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Result);
+			FJsonSerializer::Serialize(Value->AsArray(), Writer);
+			return Result;
+		}
+		return FString();
+	}
+
+	TSharedPtr<FJsonObject> GetJsonObjectForLocalValue(const TSharedPtr<FJsonValue>& JsonValue)
+	{
+		if (!JsonValue.IsValid())
+		{
+			return nullptr;
+		}
+
+		TSharedPtr<FJsonObject> ObjectValue = JsonValue->AsObject();
+		if (ObjectValue.IsValid() && ObjectValue->Values.Num() > 0)
+		{
+			return ObjectValue;
+		}
+
+		if (JsonValue->Type == EJson::String)
+		{
+			FString SerializedObject = JsonValue->AsString();
+			SerializedObject.ReplaceInline(TEXT("\\\""), TEXT("\""), ESearchCase::CaseSensitive);
+			SerializedObject.ReplaceInline(TEXT("\\\\"), TEXT("\\"), ESearchCase::CaseSensitive);
+
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(SerializedObject);
+			FJsonSerializer::Deserialize(Reader, ObjectValue);
+		}
+		return ObjectValue;
+	}
+
+	bool TryFillLocalValueFromJson(const FNiagaraTypeDefinition& InputType, const TSharedPtr<FJsonValue>& JsonValue, TSharedRef<FStructOnScope> LocalValue, FString& OutDisplayValue, FString& OutError)
+	{
+		if (!JsonValue.IsValid())
+		{
+			OutError = TEXT("Missing JSON value");
+			return false;
+		}
+
+		void* Data = LocalValue->GetStructMemory();
+		if (Data == nullptr)
+		{
+			OutError = FString::Printf(TEXT("No struct memory for Niagara type '%s'"), *InputType.GetName());
+			return false;
+		}
+
+		if (InputType == FNiagaraTypeDefinition::GetFloatDef())
+		{
+			const float Value = static_cast<float>(JsonValue->AsNumber());
+			FMemory::Memcpy(Data, &Value, sizeof(float));
+			OutDisplayValue = FString::SanitizeFloat(Value);
+			return true;
+		}
+
+		if (InputType == FNiagaraTypeDefinition::GetIntDef())
+		{
+			const int32 Value = static_cast<int32>(JsonValue->AsNumber());
+			FMemory::Memcpy(Data, &Value, sizeof(int32));
+			OutDisplayValue = FString::FromInt(Value);
+			return true;
+		}
+
+		if (InputType == FNiagaraTypeDefinition::GetBoolDef())
+		{
+			FNiagaraBool Value;
+			Value.SetValue(JsonValue->AsBool());
+			FMemory::Memcpy(Data, &Value, sizeof(FNiagaraBool));
+			OutDisplayValue = Value.GetValue() ? TEXT("true") : TEXT("false");
+			return true;
+		}
+
+		TSharedPtr<FJsonObject> ObjectValue = GetJsonObjectForLocalValue(JsonValue);
+		if (ObjectValue.IsValid())
+		{
+			if (InputType == FNiagaraTypeDefinition::GetVec2Def())
+			{
+				const FVector2f Value(
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("x"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("y"))));
+				FMemory::Memcpy(Data, &Value, sizeof(FVector2f));
+				OutDisplayValue = FString::Printf(TEXT("%f,%f"), Value.X, Value.Y);
+				return true;
+			}
+
+			if (InputType == FNiagaraTypeDefinition::GetVec3Def() || InputType == FNiagaraTypeDefinition::GetPositionDef())
+			{
+				const FVector3f Value(
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("x"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("y"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("z"))));
+				FMemory::Memcpy(Data, &Value, sizeof(FVector3f));
+				OutDisplayValue = FString::Printf(TEXT("%f,%f,%f"), Value.X, Value.Y, Value.Z);
+				return true;
+			}
+
+			if (InputType == FNiagaraTypeDefinition::GetVec4Def())
+			{
+				const FVector4f Value(
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("x"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("y"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("z"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("w"))));
+				FMemory::Memcpy(Data, &Value, sizeof(FVector4f));
+				OutDisplayValue = FString::Printf(TEXT("%f,%f,%f,%f"), Value.X, Value.Y, Value.Z, Value.W);
+				return true;
+			}
+
+			if (InputType == FNiagaraTypeDefinition::GetColorDef())
+			{
+				const FLinearColor Value(
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("r"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("g"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("b"))),
+					ObjectValue->HasField(TEXT("a")) ? static_cast<float>(ObjectValue->GetNumberField(TEXT("a"))) : 1.0f);
+				FMemory::Memcpy(Data, &Value, sizeof(FLinearColor));
+				OutDisplayValue = FString::Printf(TEXT("%f,%f,%f,%f"), Value.R, Value.G, Value.B, Value.A);
+				return true;
+			}
+		}
+
+		if (InputType.GetEnum() != nullptr)
+		{
+			const int32 EnumIndex = JsonValue->Type == EJson::Number
+				? static_cast<int32>(JsonValue->AsNumber())
+				: InputType.GetEnum()->GetIndexByNameString(JsonValue->AsString());
+			if (EnumIndex == INDEX_NONE)
+			{
+				OutError = FString::Printf(TEXT("Enum value '%s' not found for '%s'"), *LocalJsonValueToString(JsonValue), *InputType.GetName());
+				return false;
+			}
+			FMemory::Memcpy(Data, &EnumIndex, sizeof(int32));
+			OutDisplayValue = InputType.GetEnum()->GetNameStringByIndex(EnumIndex);
+			return true;
+		}
+
+		OutError = FString::Printf(TEXT("Unsupported Niagara local value type '%s'"), *InputType.GetName());
+		return false;
+	}
+
+	bool TryFillNiagaraVariableDataFromJson(const FNiagaraTypeDefinition& InputType, const TSharedPtr<FJsonValue>& JsonValue, FNiagaraVariable& LocalVariable, FString& OutDisplayValue, FString& OutError)
+	{
+		if (!JsonValue.IsValid())
+		{
+			OutError = TEXT("Missing JSON value");
+			return false;
+		}
+
+		FNiagaraEditorUtilities::ResetVariableToDefaultValue(LocalVariable);
+		LocalVariable.AllocateData();
+		if (!LocalVariable.IsDataAllocated() || LocalVariable.GetData() == nullptr)
+		{
+			OutError = FString::Printf(TEXT("Failed to allocate local data for Niagara type '%s'"), *InputType.GetName());
+			return false;
+		}
+
+		if (InputType == FNiagaraTypeDefinition::GetFloatDef())
+		{
+			const float Value = static_cast<float>(JsonValue->AsNumber());
+			LocalVariable.SetValue<float>(Value);
+			OutDisplayValue = FString::SanitizeFloat(Value);
+			return true;
+		}
+
+		if (InputType == FNiagaraTypeDefinition::GetIntDef())
+		{
+			const int32 Value = static_cast<int32>(JsonValue->AsNumber());
+			LocalVariable.SetValue<int32>(Value);
+			OutDisplayValue = FString::FromInt(Value);
+			return true;
+		}
+
+		if (InputType == FNiagaraTypeDefinition::GetBoolDef())
+		{
+			FNiagaraBool Value;
+			Value.SetValue(JsonValue->AsBool());
+			LocalVariable.SetValue<FNiagaraBool>(Value);
+			OutDisplayValue = Value.GetValue() ? TEXT("true") : TEXT("false");
+			return true;
+		}
+
+		TSharedPtr<FJsonObject> ObjectValue = GetJsonObjectForLocalValue(JsonValue);
+		if (ObjectValue.IsValid())
+		{
+			if (InputType == FNiagaraTypeDefinition::GetVec2Def())
+			{
+				const FVector2f Value(
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("x"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("y"))));
+				LocalVariable.SetValue<FVector2f>(Value);
+				OutDisplayValue = FString::Printf(TEXT("%f,%f"), Value.X, Value.Y);
+				return true;
+			}
+
+			if (InputType == FNiagaraTypeDefinition::GetVec3Def() || InputType == FNiagaraTypeDefinition::GetPositionDef())
+			{
+				const FVector3f Value(
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("x"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("y"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("z"))));
+				LocalVariable.SetValue<FVector3f>(Value);
+				OutDisplayValue = FString::Printf(TEXT("%f,%f,%f"), Value.X, Value.Y, Value.Z);
+				return true;
+			}
+
+			if (InputType == FNiagaraTypeDefinition::GetVec4Def())
+			{
+				const FVector4f Value(
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("x"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("y"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("z"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("w"))));
+				LocalVariable.SetValue<FVector4f>(Value);
+				OutDisplayValue = FString::Printf(TEXT("%f,%f,%f,%f"), Value.X, Value.Y, Value.Z, Value.W);
+				return true;
+			}
+
+			if (InputType == FNiagaraTypeDefinition::GetColorDef())
+			{
+				const FLinearColor Value(
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("r"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("g"))),
+					static_cast<float>(ObjectValue->GetNumberField(TEXT("b"))),
+					ObjectValue->HasField(TEXT("a")) ? static_cast<float>(ObjectValue->GetNumberField(TEXT("a"))) : 1.0f);
+				LocalVariable.SetValue<FLinearColor>(Value);
+				OutDisplayValue = FString::Printf(TEXT("%f,%f,%f,%f"), Value.R, Value.G, Value.B, Value.A);
+				return true;
+			}
+		}
+
+		if (InputType.GetEnum() != nullptr)
+		{
+			const int32 EnumIndex = JsonValue->Type == EJson::Number
+				? static_cast<int32>(JsonValue->AsNumber())
+				: InputType.GetEnum()->GetIndexByNameString(JsonValue->AsString());
+			if (EnumIndex == INDEX_NONE)
+			{
+				OutError = FString::Printf(TEXT("Enum value '%s' not found for '%s'"), *LocalJsonValueToString(JsonValue), *InputType.GetName());
+				return false;
+			}
+			LocalVariable.SetValue<int32>(EnumIndex);
+			OutDisplayValue = InputType.GetEnum()->GetNameStringByIndex(EnumIndex);
+			return true;
+		}
+
+		OutError = FString::Printf(TEXT("Unsupported Niagara local value type '%s'"), *InputType.GetName());
+		return false;
+	}
+
+	bool TryBuildLocalValueDataFromJson(const FNiagaraTypeDefinition& InputType, const TSharedPtr<FJsonValue>& JsonValue, TArray<uint8>& OutData, FString& OutDisplayValue, FString& OutError)
+	{
+		const int32 DataSize = InputType.GetSize();
+		if (DataSize <= 0)
+		{
+			OutError = FString::Printf(TEXT("Niagara type '%s' has no writable local data size"), *InputType.GetName());
+			return false;
+		}
+
+		OutData.SetNumUninitialized(DataSize);
+		if (InputType.GetStruct() != nullptr)
+		{
+			TSharedRef<FStructOnScope> LocalValue = MakeShared<FStructOnScope>(InputType.GetStruct());
+			if (!TryFillLocalValueFromJson(InputType, JsonValue, LocalValue, OutDisplayValue, OutError))
+			{
+				return false;
+			}
+			FMemory::Memcpy(OutData.GetData(), LocalValue->GetStructMemory(), DataSize);
+			return true;
+		}
+
+		FNiagaraVariable LocalVariable(InputType, NAME_None);
+		if (!TryFillNiagaraVariableDataFromJson(InputType, JsonValue, LocalVariable, OutDisplayValue, OutError))
+		{
+			return false;
+		}
+		FMemory::Memcpy(OutData.GetData(), LocalVariable.GetData(), DataSize);
+		return true;
+	}
+
+	bool IsRapidIterationTypeDirect(const FNiagaraTypeDefinition& InputType)
+	{
+		if (!InputType.IsValid())
+		{
+			return false;
+		}
+		if (InputType.IsStatic())
+		{
+			return true;
+		}
+		return InputType != FNiagaraTypeDefinition::GetBoolDef()
+			&& !InputType.IsEnum()
+			&& InputType != FNiagaraTypeDefinition::GetParameterMapDef()
+			&& !InputType.IsUObject();
+	}
+
+	UNiagaraNodeOutput* GetEmitterOutputNodeForStackNodeDirect(UNiagaraNode& StackNode)
+	{
+		TArray<UNiagaraNode*> PendingNodes;
+		TSet<UNiagaraNode*> VisitedNodes;
+		PendingNodes.Add(&StackNode);
+
+		while (PendingNodes.Num() > 0)
+		{
+			UNiagaraNode* CurrentNode = PendingNodes.Pop(EAllowShrinking::No);
+			if (CurrentNode == nullptr || VisitedNodes.Contains(CurrentNode))
+			{
+				continue;
+			}
+			VisitedNodes.Add(CurrentNode);
+
+			if (UNiagaraNodeOutput* OutputNode = Cast<UNiagaraNodeOutput>(CurrentNode))
+			{
+				return OutputNode;
+			}
+
+			UEdGraphPin* MapOutputPin = GetParameterMapPin(*CurrentNode, EGPD_Output);
+			if (MapOutputPin == nullptr)
+			{
+				continue;
+			}
+
+			for (UEdGraphPin* LinkedPin : MapOutputPin->LinkedTo)
+			{
+				if (LinkedPin != nullptr)
+				{
+					if (UNiagaraNode* LinkedNode = Cast<UNiagaraNode>(LinkedPin->GetOwningNode()))
+					{
+						PendingNodes.Add(LinkedNode);
+					}
+				}
+			}
+		}
+
+		return nullptr;
+	}
+
+	FNiagaraVariable CreateRapidIterationParameterDirect(const FString& UniqueEmitterName, ENiagaraScriptUsage ScriptUsage, const FName& AliasedInputName, const FNiagaraTypeDefinition& InputType)
+	{
+		FNiagaraVariable InputVariable(InputType, AliasedInputName);
+		const TCHAR* EmitterNameForRapidIteration = (ScriptUsage == ENiagaraScriptUsage::SystemSpawnScript || ScriptUsage == ENiagaraScriptUsage::SystemUpdateScript)
+			? nullptr
+			: *UniqueEmitterName;
+		const FString RapidIterationName = FNiagaraUtilities::CreateRapidIterationConstantName(AliasedInputName, EmitterNameForRapidIteration, ScriptUsage);
+		InputVariable.SetName(FName(*RapidIterationName));
+		return InputVariable;
+	}
+
+	template<typename EntryType>
+	void CollectStackEntriesOfType(UNiagaraStackEntry* RootEntry, TArray<EntryType*>& OutEntries)
+	{
+		if (RootEntry == nullptr)
+		{
+			return;
+		}
+		RootEntry->RefreshChildren();
+		if (EntryType* TypedEntry = Cast<EntryType>(RootEntry))
+		{
+			OutEntries.Add(TypedEntry);
+		}
+
+		TArray<UNiagaraStackEntry*> Children;
+		RootEntry->GetUnfilteredChildren(Children);
+		for (UNiagaraStackEntry* Child : Children)
+		{
+			CollectStackEntriesOfType<EntryType>(Child, OutEntries);
+		}
+	}
+
+	UNiagaraStackFunctionInput* FindStackFunctionInputForModule(
+		UNiagaraSystem& System,
+		int32 EmitterIndex,
+		UNiagaraNodeFunctionCall& ModuleNode,
+		const FString& InputName,
+		TSharedPtr<FNiagaraSystemViewModel>& OutSystemViewModel,
+		UNiagaraStackViewModel*& OutStackViewModel)
+	{
+		FNiagaraSystemViewModelOptions SystemOptions;
+		SystemOptions.EditMode = ENiagaraSystemViewModelEditMode::SystemAsset;
+		SystemOptions.bCanAutoCompile = false;
+		SystemOptions.bCanSimulate = false;
+		SystemOptions.bIsForDataProcessingOnly = true;
+		SystemOptions.bCompileForEdit = false;
+
+		OutSystemViewModel = MakeShared<FNiagaraSystemViewModel>();
+		OutSystemViewModel->Initialize(System, SystemOptions);
+
+		TSharedPtr<FNiagaraEmitterHandleViewModel> EmitterHandleViewModel;
+		if (EmitterIndex != INDEX_NONE)
+		{
+			const TArray<FNiagaraEmitterHandle>& EmitterHandles = System.GetEmitterHandles();
+			if (!EmitterHandles.IsValidIndex(EmitterIndex))
+			{
+				return nullptr;
+			}
+
+			const FGuid EmitterHandleId = EmitterHandles[EmitterIndex].GetId();
+			EmitterHandleViewModel = OutSystemViewModel->GetEmitterHandleViewModelById(EmitterHandleId);
+		}
+
+		FNiagaraStackViewModelOptions StackOptions(true, true);
+		OutStackViewModel = NewObject<UNiagaraStackViewModel>(GetTransientPackage());
+		OutStackViewModel->InitializeWithViewModels(OutSystemViewModel, EmitterHandleViewModel, StackOptions);
+		if (OutStackViewModel->GetRootEntry() == nullptr)
+		{
+			return nullptr;
+		}
+
+		TArray<UNiagaraStackModuleItem*> ModuleItems;
+		CollectStackEntriesOfType<UNiagaraStackModuleItem>(OutStackViewModel->GetRootEntry(), ModuleItems);
+
+		UNiagaraStackModuleItem* TargetModuleItem = nullptr;
+		for (UNiagaraStackModuleItem* ModuleItem : ModuleItems)
+		{
+			if (ModuleItem != nullptr && &ModuleItem->GetModuleNode() == &ModuleNode)
+			{
+				TargetModuleItem = ModuleItem;
+				break;
+			}
+		}
+
+		if (TargetModuleItem == nullptr)
+		{
+			return nullptr;
+		}
+
+		TargetModuleItem->RefreshChildren();
+		TArray<UNiagaraStackFunctionInput*> ParameterInputs;
+		TargetModuleItem->GetParameterInputs(ParameterInputs);
+
+		FString InputNameNoSpaces = InputName;
+		InputNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+		for (UNiagaraStackFunctionInput* FunctionInput : ParameterInputs)
+		{
+			if (FunctionInput == nullptr)
+			{
+				continue;
+			}
+
+			const FString ShortHandle = StripModulePrefix(FunctionInput->GetInputParameterHandle().GetParameterHandleString()).ToString();
+			const FString DisplayName = FunctionInput->GetDisplayName().ToString();
+			FString DisplayNameNoSpaces = DisplayName;
+			DisplayNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+
+			if (ShortHandle.Equals(InputName, ESearchCase::IgnoreCase) ||
+				DisplayName.Equals(InputName, ESearchCase::IgnoreCase) ||
+				DisplayNameNoSpaces.Equals(InputNameNoSpaces, ESearchCase::IgnoreCase))
+			{
+				return FunctionInput;
+			}
+		}
+
+		return nullptr;
+	}
+
+	FStackLocalValueWriteResult TrySetRapidIterationInputDirect(
+		UNiagaraSystem& System,
+		int32 EmitterIndex,
+		UNiagaraNodeFunctionCall& ModuleNode,
+		const FName& MatchedFullName,
+		const FString& InputName,
+		const FNiagaraTypeDefinition& InputType,
+		const TSharedPtr<FJsonValue>& JsonValue)
+	{
+		FStackLocalValueWriteResult Result;
+
+		if (!InputType.IsValid() || InputType.IsStatic() || !IsRapidIterationTypeDirect(InputType))
+		{
+			return Result;
+		}
+
+		const TArray<FNiagaraEmitterHandle>& EmitterHandles = System.GetEmitterHandles();
+		if (!EmitterHandles.IsValidIndex(EmitterIndex))
+		{
+			return Result;
+		}
+
+		UNiagaraNodeOutput* OutputNode = GetEmitterOutputNodeForStackNodeDirect(ModuleNode);
+		if (OutputNode == nullptr)
+		{
+			return Result;
+		}
+
+		FVersionedNiagaraEmitter VE = EmitterHandles[EmitterIndex].GetInstance();
+		if (VE.Emitter == nullptr || VE.GetEmitterData() == nullptr)
+		{
+			return Result;
+		}
+
+		TArray<uint8> LocalValueData;
+		FString DisplayValue;
+		FString Error;
+		if (!TryBuildLocalValueDataFromJson(InputType, JsonValue, LocalValueData, DisplayValue, Error))
+		{
+			Result.Error = Error;
+			return Result;
+		}
+
+		const FString UniqueEmitterName = VE.Emitter->GetUniqueEmitterName();
+		FNiagaraParameterHandle AliasedHandle = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(FNiagaraParameterHandle(MatchedFullName), &ModuleNode);
+		FNiagaraVariable RapidVar = CreateRapidIterationParameterDirect(UniqueEmitterName, OutputNode->GetUsage(), AliasedHandle.GetParameterHandleString(), InputType);
+
+		TArray<UNiagaraScript*> ScriptsToUpdate;
+		ScriptsToUpdate.AddUnique(VE.GetEmitterData()->GetScript(OutputNode->GetUsage(), OutputNode->GetUsageId()));
+		if (OutputNode->GetUsage() == ENiagaraScriptUsage::ParticleSpawnScript)
+		{
+			ScriptsToUpdate.AddUnique(VE.GetEmitterData()->GetScript(ENiagaraScriptUsage::ParticleSpawnScriptInterpolated, OutputNode->GetUsageId()));
+		}
+
+		int32 UpdatedScriptCount = 0;
+		for (UNiagaraScript* Script : ScriptsToUpdate)
+		{
+			if (Script == nullptr)
+			{
+				continue;
+			}
+
+			Script->Modify();
+			Script->RapidIterationParameters.SetParameterData(LocalValueData.GetData(), RapidVar, true);
+			++UpdatedScriptCount;
+		}
+
+		if (UpdatedScriptCount == 0)
+		{
+			Result.Error = FString::Printf(TEXT("No script found for direct rapid iteration write for input '%s'"), *InputName);
+			return Result;
+		}
+
+		System.RequestCompile(true);
+		System.WaitForCompilationComplete();
+		System.MarkPackageDirty();
+
+		Result.bSuccess = true;
+		Result.bUsedStackInput = true;
+		Result.bUsedRapidIteration = true;
+		Result.bUsedDirectRapidIteration = true;
+		Result.WrittenValue = DisplayValue;
+		return Result;
+	}
+
+	FStackLocalValueWriteResult TrySetStackFunctionInputLocalValue(
+		UNiagaraSystem& System,
+		int32 EmitterIndex,
+		UNiagaraNodeFunctionCall& ModuleNode,
+		const FString& InputName,
+		const FName& MatchedFullName,
+		const FNiagaraTypeDefinition& MatchedInputType,
+		const TSharedPtr<FJsonValue>& JsonValue)
+	{
+		FStackLocalValueWriteResult Result;
+
+		FStackLocalValueWriteResult DirectRapidIterationResult = TrySetRapidIterationInputDirect(
+			System, EmitterIndex, ModuleNode, MatchedFullName, InputName, MatchedInputType, JsonValue);
+		if (DirectRapidIterationResult.bSuccess || !DirectRapidIterationResult.Error.IsEmpty())
+		{
+			return DirectRapidIterationResult;
+		}
+
+		TSharedPtr<FNiagaraSystemViewModel> SystemViewModel;
+		UNiagaraStackViewModel* StackViewModel = nullptr;
+		UNiagaraStackFunctionInput* FunctionInput = FindStackFunctionInputForModule(
+			System, EmitterIndex, ModuleNode, InputName, SystemViewModel, StackViewModel);
+
+		if (FunctionInput == nullptr)
+		{
+			Result.Error = FString::Printf(TEXT("Stack input '%s' was not found for module '%s'"), *InputName, *ModuleNode.GetFunctionName());
+			return Result;
+		}
+
+		const FNiagaraTypeDefinition& InputType = FunctionInput->GetInputType();
+		if (InputType.GetStruct() == nullptr)
+		{
+			Result.Error = FString::Printf(TEXT("Stack input '%s' has no local value struct for Niagara type '%s'"), *InputName, *InputType.GetName());
+			return Result;
+		}
+
+		TSharedRef<FStructOnScope> LocalValue = MakeShared<FStructOnScope>(InputType.GetStruct());
+		FString DisplayValue;
+		FString Error;
+		if (!TryFillLocalValueFromJson(InputType, JsonValue, LocalValue, DisplayValue, Error))
+		{
+			Result.Error = Error;
+			return Result;
+		}
+
+		FunctionInput->SetLocalValue(LocalValue);
+		if (StackViewModel != nullptr)
+		{
+			StackViewModel->RequestRefreshDeferred();
+			StackViewModel->Tick();
+		}
+
+		System.RequestCompile(true);
+		System.WaitForCompilationComplete();
+		System.MarkPackageDirty();
+
+		Result.bSuccess = true;
+		Result.bUsedStackInput = true;
+		Result.bUsedRapidIteration = FunctionInput->GetValueMode() == UNiagaraStackFunctionInput::EValueMode::Local;
+		Result.WrittenValue = DisplayValue;
+		return Result;
+	}
+
+	bool TrySetFunctionCallPinLocalValueAndRefresh(
+		UNiagaraSystem& System,
+		UNiagaraNodeFunctionCall& ModuleNode,
+		UEdGraphPin& TargetPin,
+		const FString& PinDefaultValue,
+		FString& OutError)
+	{
+		TargetPin.Modify();
+		TargetPin.DefaultValue = PinDefaultValue;
+
+		UNiagaraNode* NiagaraNode = Cast<UNiagaraNode>(TargetPin.GetOwningNode());
+		if (NiagaraNode == nullptr)
+		{
+			OutError = TEXT("Target pin owner is not a Niagara node");
+			return false;
+		}
+
+		NiagaraNode->MarkNodeRequiresSynchronization(TEXT("Monolith Stack local value write"), true);
+		ModuleNode.RefreshFromExternalChanges();
+		if (UNiagaraGraph* Graph = ModuleNode.GetNiagaraGraph())
+		{
+			Graph->NotifyGraphChanged();
+		}
+
+		System.RequestCompile(true);
+		System.WaitForCompilationComplete();
+		System.MarkPackageDirty();
+		return true;
+	}
+
 	// Serialize an FRichCurve to a JSON array of key objects
 	TArray<TSharedPtr<FJsonValue>> SerializeCurveKeys(const FRichCurve& Curve)
 	{
@@ -3561,13 +4304,13 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 	}
 
 	// Match input by short name (strip Module. prefix for comparison)
-	FNiagaraTypeDefinition InputType;
 	bool bInputFound = false;
 	FName MatchedFullName;
+	FNiagaraTypeDefinition MatchedInputType;
 	for (const FNiagaraVariable& In : Inputs)
 	{
 		FName ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName());
-		if (ShortName == FName(*InputName)) { InputType = In.GetType(); MatchedFullName = In.GetName(); bInputFound = true; break; }
+		if (ShortName == FName(*InputName)) { MatchedFullName = In.GetName(); MatchedInputType = In.GetType(); bInputFound = true; break; }
 	}
 
 	if (!bInputFound)
@@ -3582,11 +4325,11 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetModIn", "Set Module Input"));
 	System->Modify();
 
-	UEdGraphPin* TargetPin = nullptr;
 	if (bCustomHlslFallback)
 	{
 		// CustomHlsl fallback: set DefaultValue directly on the FunctionCall's typed input pin.
 		// No ParameterMapSet override node exists for these modules.
+		UEdGraphPin* TargetPin = nullptr;
 		for (UEdGraphPin* Pin : MN->Pins)
 		{
 			if (Pin->Direction == EGPD_Input && Pin->PinName == MatchedFullName)
@@ -3604,60 +4347,76 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 		{
 			TargetPin->BreakAllPinLinks();
 		}
-	}
-	else
-	{
-		// Standard path: use the ParameterMap override pin system
-		FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
-			FNiagaraParameterHandle(MatchedFullName), MN);
 
-		// UE 5.7 FIX: 5-param version of GetOrCreateStackFunctionInputOverridePin
-		UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
-			*MN, AH, InputType, FGuid(), FGuid());
-
-		// Guard: break existing links so the literal DefaultValue actually takes effect
-		if (OverridePin.LinkedTo.Num() > 0)
+		FString ValStr;
+		if (JV->Type == EJson::Number) ValStr = FString::SanitizeFloat(JV->AsNumber());
+		else if (JV->Type == EJson::Boolean) ValStr = JV->AsBool() ? TEXT("true") : TEXT("false");
+		else if (JV->Type == EJson::String) ValStr = JV->AsString();
+		else if (JV->Type == EJson::Object)
 		{
-			OverridePin.BreakAllPinLinks();
+			TSharedPtr<FJsonObject> O = JV->AsObject();
+			if (O->HasField(TEXT("x")))
+			{
+				double X = O->GetNumberField(TEXT("x")), Y = O->GetNumberField(TEXT("y"));
+				double Z = O->HasField(TEXT("z")) ? O->GetNumberField(TEXT("z")) : 0.0;
+				double W = O->HasField(TEXT("w")) ? O->GetNumberField(TEXT("w")) : 0.0;
+				if (O->HasField(TEXT("w"))) ValStr = FString::Printf(TEXT("%f,%f,%f,%f"), X, Y, Z, W);
+				else if (O->HasField(TEXT("z"))) ValStr = FString::Printf(TEXT("%f,%f,%f"), X, Y, Z);
+				else ValStr = FString::Printf(TEXT("%f,%f"), X, Y);
+			}
+			else if (O->HasField(TEXT("r")))
+			{
+				double R2 = O->GetNumberField(TEXT("r")), G = O->GetNumberField(TEXT("g"));
+				double B = O->GetNumberField(TEXT("b")), A = O->HasField(TEXT("a")) ? O->GetNumberField(TEXT("a")) : 1.0;
+				ValStr = FString::Printf(TEXT("%f,%f,%f,%f"), R2, G, B, A);
+			}
+			else
+			{
+				TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&ValStr);
+				FJsonSerializer::Serialize(O.ToSharedRef(), W);
+			}
 		}
-		TargetPin = &OverridePin;
-	}
+		else ValStr = JsonValueToString(JV);
 
-	FString ValStr;
-	if (JV->Type == EJson::Number) ValStr = FString::SanitizeFloat(JV->AsNumber());
-	else if (JV->Type == EJson::Boolean) ValStr = JV->AsBool() ? TEXT("true") : TEXT("false");
-	else if (JV->Type == EJson::String) ValStr = JV->AsString();
-	else if (JV->Type == EJson::Object)
-	{
-		TSharedPtr<FJsonObject> O = JV->AsObject();
-		if (O->HasField(TEXT("x")))
+		TargetPin->Modify();
+		const UEdGraphSchema_Niagara* Schema = GetDefault<UEdGraphSchema_Niagara>();
+		Schema->TrySetDefaultValue(*TargetPin, ValStr);
+		if (UNiagaraNode* NiagaraNode = Cast<UNiagaraNode>(TargetPin->GetOwningNode()))
 		{
-			double X = O->GetNumberField(TEXT("x")), Y = O->GetNumberField(TEXT("y"));
-			double Z = O->HasField(TEXT("z")) ? O->GetNumberField(TEXT("z")) : 0.0;
-			double W = O->HasField(TEXT("w")) ? O->GetNumberField(TEXT("w")) : 0.0;
-			if (O->HasField(TEXT("w"))) ValStr = FString::Printf(TEXT("%f,%f,%f,%f"), X, Y, Z, W);
-			else if (O->HasField(TEXT("z"))) ValStr = FString::Printf(TEXT("%f,%f,%f"), X, Y, Z);
-			else ValStr = FString::Printf(TEXT("%f,%f"), X, Y);
-		}
-		else if (O->HasField(TEXT("r")))
-		{
-			double R2 = O->GetNumberField(TEXT("r")), G = O->GetNumberField(TEXT("g"));
-			double B = O->GetNumberField(TEXT("b")), A = O->HasField(TEXT("a")) ? O->GetNumberField(TEXT("a")) : 1.0;
-			ValStr = FString::Printf(TEXT("%f,%f,%f,%f"), R2, G, B, A);
+			NiagaraNode->MarkNodeRequiresSynchronization(TEXT("Monolith CustomHlsl input write"), true);
 		}
 		else
 		{
-			TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&ValStr);
-			FJsonSerializer::Serialize(O.ToSharedRef(), W);
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("Target pin owner is not a Niagara node"));
 		}
+		System->RequestCompile(true);
+		System->WaitForCompilationComplete();
+		System->MarkPackageDirty();
+
+		GEditor->EndTransaction();
+		return SuccessStr(FString::Printf(TEXT("Set input '%s' = '%s'"), *InputName, *ValStr));
 	}
-	else ValStr = JsonValueToString(JV);
 
-	TargetPin->DefaultValue = ValStr;
+	MonolithNiagaraHelpers::FStackLocalValueWriteResult StackWrite = MonolithNiagaraHelpers::TrySetStackFunctionInputLocalValue(
+		*System, EmitterIdx, *MN, InputName, MatchedFullName, MatchedInputType, JV);
+	if (!StackWrite.bSuccess)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(StackWrite.Error);
+	}
 	GEditor->EndTransaction();
-	System->RequestCompile(false);
 
-	return SuccessStr(FString::Printf(TEXT("Set input '%s' = '%s'"), *InputName, *ValStr));
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("input"), InputName);
+	Result->SetStringField(TEXT("value"), StackWrite.WrittenValue);
+	Result->SetBoolField(TEXT("used_stack_input"), StackWrite.bUsedStackInput);
+	Result->SetBoolField(TEXT("used_rapid_iteration"), StackWrite.bUsedRapidIteration);
+	Result->SetBoolField(TEXT("used_direct_rapid_iteration"), StackWrite.bUsedDirectRapidIteration);
+	Result->SetStringField(TEXT("message"), StackWrite.bUsedDirectRapidIteration
+		? FString::Printf(TEXT("Set input '%s' = '%s' via direct rapid iteration"), *InputName, *StackWrite.WrittenValue)
+		: FString::Printf(TEXT("Set input '%s' = '%s'"), *InputName, *StackWrite.WrittenValue));
+	return FMonolithActionResult::Success(Result);
 }
 
 FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputBinding(const TSharedPtr<FJsonObject>& Params)
@@ -6661,12 +7420,39 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetStaticSwitchValue(const 
 	else if (JV->Type == EJson::Boolean) ValStr = JV->AsBool() ? TEXT("true") : TEXT("false");
 	else ValStr = JV->AsString();
 
-	SwitchPin->DefaultValue = ValStr;
+	const FString RequestedValStr = ValStr;
+	FString InternalValStr;
+	FString NormalizeError;
+	if (!MonolithNiagaraHelpers::TryNormalizeStaticSwitchValue(InputType, ValStr, InternalValStr, NormalizeError))
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(NormalizeError);
+	}
+	ValStr = InternalValStr;
+
+	FString RefreshError;
+	if (!MonolithNiagaraHelpers::TrySetFunctionCallPinLocalValueAndRefresh(*System, *MN, *SwitchPin, ValStr, RefreshError))
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to set static switch '%s' via stack input (%s) and refresh fallback (%s)"),
+			*InputName, TEXT("not attempted"), *RefreshError));
+	}
 
 	GEditor->EndTransaction();
-	System->RequestCompile(false);
 
-	return SuccessStr(FString::Printf(TEXT("Static switch '%s' set to '%s'"), *InputName, *ValStr));
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("input"), InputName);
+	R->SetStringField(TEXT("value"), ValStr);
+	if (!RequestedValStr.Equals(ValStr, ESearchCase::CaseSensitive))
+	{
+		R->SetStringField(TEXT("requested_value"), RequestedValStr);
+	}
+	R->SetBoolField(TEXT("used_stack_input"), false);
+	R->SetBoolField(TEXT("used_refresh_fallback"), true);
+	R->SetBoolField(TEXT("used_direct_refresh"), true);
+	R->SetStringField(TEXT("message"), FString::Printf(TEXT("Static switch '%s' set to '%s' via direct refresh path (Niagara stack refresh path)"), *InputName, *ValStr));
+	return SuccessObj(R);
 }
 
 // ============================================================================
