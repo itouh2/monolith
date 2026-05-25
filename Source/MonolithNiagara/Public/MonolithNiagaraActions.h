@@ -86,8 +86,9 @@ public:
 	// --- HLSL (1) ---
 	static FMonolithActionResult HandleGetCompiledGPUHLSL(const TSharedPtr<FJsonObject>& Params);
 
-	// --- Diagnostics (1) ---
+	// --- Diagnostics (2) ---
 	static FMonolithActionResult HandleGetSystemDiagnostics(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetStackIssues(const TSharedPtr<FJsonObject>& Params);
 
 	// --- System Property (2) ---
 	static FMonolithActionResult HandleGetSystemProperty(const TSharedPtr<FJsonObject>& Params);

@@ -42,7 +42,9 @@
 #include "ViewModels/Stack/NiagaraStackViewModel.h"
 #include "ViewModels/Stack/NiagaraStackEntry.h"
 #include "ViewModels/Stack/NiagaraStackModuleItem.h"
+#include "ViewModels/Stack/NiagaraStackScriptItemGroup.h"
 #include "ViewModels/Stack/NiagaraStackFunctionInput.h"
+#include "ViewModels/NiagaraEmitterViewModel.h"
 #include "UObject/StructOnScope.h"
 #include "NiagaraParameterMapHistory.h"
 #include "NiagaraSystemEditorData.h"
@@ -64,6 +66,8 @@
 #include "Editor.h"
 #include "Misc/PackageName.h"
 #include "UObject/SavePackage.h"
+#include "Subsystems/AssetEditorSubsystem.h"
+#include "UObject/UObjectIterator.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -2832,12 +2836,18 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
 			.Build());
 
-	// Diagnostics (1)
+	// Diagnostics (2)
 	Registry.RegisterAction(TEXT("niagara"), TEXT("get_system_diagnostics"), TEXT("Get compile errors, warnings, renderer issues, and script stats"),
 		FMonolithActionHandler::CreateStatic(&HandleGetSystemDiagnostics),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Niagara system asset path"))
 			.Optional(TEXT("compile_first"), TEXT("boolean"), TEXT("Force synchronous compile before collecting diagnostics (default: true)"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_stack_issues"), TEXT("Get Niagara System Editor Stack Issues (warnings/errors not surfaced via get_system_diagnostics)"),
+		FMonolithActionHandler::CreateStatic(&HandleGetStackIssues),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Niagara system asset path"))
+			.Optional(TEXT("severity_filter"), TEXT("array"), TEXT("Subset of {Error, Warning, Info} to include"))
 			.Build());
 
 	// System Property (2)
@@ -7024,6 +7034,445 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetSystemDiagnostics(const 
 	R->SetArrayField(TEXT("info"), Info);
 	R->SetArrayField(TEXT("emitter_stats"), EmitterStats);
 	R->SetBoolField(TEXT("has_issues"), Errors.Num() > 0 || Warnings.Num() > 0);
+	return SuccessObj(R);
+}
+
+// ============================================================================
+// get_stack_issues — Return Niagara System Editor Stack Issues (Error/Warning/Info)
+//   spec: docs/superpowers/specs/2026-05-25-monolith-niagara-get-stack-issues-design.md
+//   plan: docs/superpowers/plans/2026-05-25-monolith-niagara-get-stack-issues.md
+//   Phase 1 (Task 1): skeleton — ViewModel init + StackVM null check until Verify-2 PASS.
+//                                walk / collect / fix hint estimation are added in Task 3-4.
+// ============================================================================
+FMonolithActionResult FMonolithNiagaraActions::HandleGetStackIssues(const TSharedPtr<FJsonObject>& Params)
+{
+	// ---- 1. param parse ----
+	const FString SystemPath = GetAssetPath(Params);
+	if (SystemPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("missing required param: asset_path"));
+	}
+
+	TSet<FString> SeverityFilter;
+	const TArray<TSharedPtr<FJsonValue>>* SeverityArr = nullptr;
+	if (Params->TryGetArrayField(TEXT("severity_filter"), SeverityArr) && SeverityArr)
+	{
+		for (const TSharedPtr<FJsonValue>& V : *SeverityArr)
+		{
+			FString S;
+			if (V.IsValid() && V->TryGetString(S))
+			{
+				if (S == TEXT("Error") || S == TEXT("Warning") || S == TEXT("Info"))
+				{
+					SeverityFilter.Add(S);
+				}
+			}
+		}
+	}
+
+	// ---- 2. asset load ----
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("failed to load Niagara system: %s"), *SystemPath));
+	}
+
+	// ---- 3. Open the Niagara editor and borrow its real UI stack view model ----
+	UAssetEditorSubsystem* AssetEditorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>() : nullptr;
+	if (!AssetEditorSubsystem)
+	{
+		return FMonolithActionResult::Error(TEXT("failed to obtain AssetEditorSubsystem"));
+	}
+
+	const bool bWasAlreadyOpen = AssetEditorSubsystem->FindEditorForAsset(System, false) != nullptr;
+	if (!AssetEditorSubsystem->OpenEditorForAsset(System))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("failed to open Niagara system editor: %s"), *SystemPath));
+	}
+	IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(System, false);
+	const FString EditorName = EditorInstance ? EditorInstance->GetEditorName().ToString() : TEXT("none");
+	const int32 OpenEditorCount = AssetEditorSubsystem->FindEditorsForAsset(System).Num();
+
+	auto CloseEditorIfOpenedByThisAction = [&]()
+	{
+		if (!bWasAlreadyOpen)
+		{
+			AssetEditorSubsystem->CloseAllEditorsForAsset(System);
+		}
+	};
+
+	int32 StackViewModelCount = 0;
+	int32 RootBackedStackViewModelCount = 0;
+	auto FindStackViewModelsForSystem = [System, &StackViewModelCount, &RootBackedStackViewModelCount]() -> TArray<UNiagaraStackViewModel*>
+	{
+		TArray<UNiagaraStackViewModel*> MatchingStackViewModels;
+		for (TObjectIterator<UNiagaraStackViewModel> It; It; ++It)
+		{
+			UNiagaraStackViewModel* Candidate = *It;
+			if (!Candidate || Candidate->HasAnyFlags(RF_ClassDefaultObject))
+			{
+				continue;
+			}
+
+			++StackViewModelCount;
+			if (UNiagaraStackEntry* CandidateRoot = Candidate->GetRootEntry())
+			{
+				++RootBackedStackViewModelCount;
+				TSharedPtr<FNiagaraSystemViewModel> CandidateSystemViewModel = CandidateRoot->GetSystemViewModelPtr();
+				if (CandidateSystemViewModel.IsValid() && &CandidateSystemViewModel->GetSystem() == System)
+				{
+					MatchingStackViewModels.AddUnique(Candidate);
+				}
+			}
+		}
+		return MatchingStackViewModels;
+	};
+
+	TArray<UNiagaraStackViewModel*> StackVMs = FindStackViewModelsForSystem();
+	if (StackVMs.Num() == 0)
+	{
+		CloseEditorIfOpenedByThisAction();
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("failed to obtain Niagara asset editor stack view model (editor=%s, open_editors=%d, stack_view_models=%d, root_backed_stack_view_models=%d)"),
+			*EditorName,
+			OpenEditorCount,
+			StackViewModelCount,
+			RootBackedStackViewModelCount));
+	}
+
+	TArray<UNiagaraStackEntry*> RootEntries;
+	for (UNiagaraStackViewModel* StackVM : StackVMs)
+	{
+		if (!StackVM)
+		{
+			continue;
+		}
+
+		StackVM->RequestRefreshDeferred();
+		StackVM->RequestValidationUpdate();
+		StackVM->Tick();
+
+		if (UNiagaraStackEntry* RootEntry = StackVM->GetRootEntry())
+		{
+			RootEntry->RefreshChildren();
+			RootEntries.AddUnique(RootEntry);
+		}
+	}
+	if (RootEntries.Num() == 0)
+	{
+		CloseEditorIfOpenedByThisAction();
+		return FMonolithActionResult::Error(TEXT("stack walk failed: all root entries are null"));
+	}
+
+	// ---- 4. walk + collect ----
+	// Severity -> string (None は sentinel で除外、issue として collect しない)
+	auto SeverityToString = [](EStackIssueSeverity Sev) -> FString
+	{
+		switch (Sev)
+		{
+		case EStackIssueSeverity::Error:   return TEXT("Error");
+		case EStackIssueSeverity::Warning: return TEXT("Warning");
+		case EStackIssueSeverity::Info:    return TEXT("Info");
+		default:                           return FString();  // None
+		}
+	};
+	auto FixStyleToString = [](UNiagaraStackEntry::EStackIssueFixStyle Style) -> FString
+	{
+		return (Style == UNiagaraStackEntry::EStackIssueFixStyle::Fix) ? TEXT("Fix") : TEXT("Link");
+	};
+
+	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	AssetRegistry.ScanPathsSynchronous({TEXT("/Niagara/")}, /*bForceRescan=*/false);
+
+	FARFilter NiagaraScriptFilter;
+	NiagaraScriptFilter.ClassPaths.Add(UNiagaraScript::StaticClass()->GetClassPathName());
+	NiagaraScriptFilter.bRecursiveClasses = true;
+	NiagaraScriptFilter.bRecursivePaths = true;
+
+	TArray<FAssetData> NiagaraScriptAssets;
+	AssetRegistry.GetAssets(NiagaraScriptFilter, NiagaraScriptAssets);
+
+	TMap<FString, TArray<FAssetData>> ScriptAssetsByName;
+	for (const FAssetData& ScriptAsset : NiagaraScriptAssets)
+	{
+		ScriptAssetsByName.FindOrAdd(ScriptAsset.AssetName.ToString()).Add(ScriptAsset);
+	}
+
+	auto ResolveScriptAssetByName = [&ScriptAssetsByName](const FString& CandidateName, FAssetData& OutAssetData) -> bool
+	{
+		const TArray<FAssetData>* Matches = ScriptAssetsByName.Find(CandidateName);
+		if (!Matches || Matches->Num() == 0)
+		{
+			return false;
+		}
+		if (Matches->Num() == 1)
+		{
+			OutAssetData = (*Matches)[0];
+			return true;
+		}
+
+		const FAssetData* EngineMatch = nullptr;
+		for (const FAssetData& Match : *Matches)
+		{
+			if (Match.PackageName.ToString().StartsWith(TEXT("/Niagara/")))
+			{
+				if (EngineMatch != nullptr)
+				{
+					return false;
+				}
+				EngineMatch = &Match;
+			}
+		}
+		if (EngineMatch)
+		{
+			OutAssetData = *EngineMatch;
+			return true;
+		}
+		return false;
+	};
+
+	auto GetUniqueSupportedStage = [](const FAssetData& ScriptAsset) -> FString
+	{
+		int32 UsageBitmask = 0;
+		const FString BitfieldTagValue = ScriptAsset.GetTagValueRef<FString>(GET_MEMBER_NAME_CHECKED(FVersionedNiagaraScriptData, ModuleUsageBitmask));
+		if (!BitfieldTagValue.IsEmpty())
+		{
+			UsageBitmask = FCString::Atoi(*BitfieldTagValue);
+		}
+		if (UsageBitmask == 0)
+		{
+			if (UNiagaraScript* Script = Cast<UNiagaraScript>(ScriptAsset.GetAsset()))
+			{
+				if (FVersionedNiagaraScriptData* ScriptData = Script->GetLatestScriptData())
+				{
+					UsageBitmask = ScriptData->ModuleUsageBitmask;
+				}
+			}
+		}
+
+		TSet<FString> SupportedStages;
+		for (ENiagaraScriptUsage SupportedUsage : UNiagaraScript::GetSupportedUsageContextsForBitmask(UsageBitmask))
+		{
+			const FString SupportedStage = FMonolithNiagaraActions::UsageToString(SupportedUsage);
+			if (!SupportedStage.IsEmpty() && SupportedStage != TEXT("unknown"))
+			{
+				SupportedStages.Add(SupportedStage);
+			}
+		}
+		if (SupportedStages.Num() == 1)
+		{
+			for (const FString& Stage : SupportedStages)
+			{
+				return Stage;
+			}
+		}
+		return FString();
+	};
+
+	auto TryInferModuleFixHint = [&ResolveScriptAssetByName, &GetUniqueSupportedStage](const FString& Text, FString& OutModuleToAdd, FString& OutTargetStage) -> bool
+	{
+		FString Token;
+		auto FlushToken = [&]()
+		{
+			if (Token.Len() >= 3)
+			{
+				FAssetData ScriptAsset;
+				if (ResolveScriptAssetByName(Token, ScriptAsset))
+				{
+					OutModuleToAdd = ScriptAsset.GetSoftObjectPath().ToString();
+					OutTargetStage = GetUniqueSupportedStage(ScriptAsset);
+					Token.Reset();
+					return true;
+				}
+			}
+			Token.Reset();
+			return false;
+		};
+
+		for (int32 CharIndex = 0; CharIndex < Text.Len(); ++CharIndex)
+		{
+			const TCHAR Ch = Text[CharIndex];
+			if (FChar::IsAlnum(Ch) || Ch == TCHAR('_'))
+			{
+				Token.AppendChar(Ch);
+			}
+			else if (FlushToken())
+			{
+				return true;
+			}
+		}
+		return FlushToken();
+	};
+
+	TArray<TSharedPtr<FJsonValue>> IssueValues;
+
+	// emitter handle 検索 helper: FVersionedNiagaraEmitter から SystemHandles 上の Name を逆引き
+	auto LookupEmitterName = [System](TSharedPtr<FNiagaraEmitterViewModel> EmitterVM) -> FString
+	{
+		if (!EmitterVM.IsValid())
+		{
+			return FString();
+		}
+		FVersionedNiagaraEmitter VEmitter = EmitterVM->GetEmitter();
+		UNiagaraEmitter* TargetEmitter = VEmitter.Emitter;
+		if (!TargetEmitter)
+		{
+			return FString();
+		}
+		for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+		{
+			if (Handle.GetInstance().Emitter == TargetEmitter)
+			{
+				return Handle.GetName().ToString();
+			}
+		}
+		return FString();
+	};
+
+	// 再帰 walk: 各 entry の Issues を収集、parent chain 上の UNiagaraStackScriptItemGroup を CurrentGroup として propagate
+	TFunction<void(UNiagaraStackEntry*, UNiagaraStackScriptItemGroup*)> Recurse;
+	Recurse = [&](UNiagaraStackEntry* Entry, UNiagaraStackScriptItemGroup* CurrentGroup)
+	{
+		if (!Entry) return;
+
+		// このノードが script group ならそれを CurrentGroup として下流に propagate
+		if (UNiagaraStackScriptItemGroup* AsGroup = Cast<UNiagaraStackScriptItemGroup>(Entry))
+		{
+			CurrentGroup = AsGroup;
+		}
+
+		const TArray<UNiagaraStackEntry::FStackIssue>& Issues = Entry->GetIssues();
+		for (const UNiagaraStackEntry::FStackIssue& Issue : Issues)
+		{
+			const FString SevStr = SeverityToString(Issue.GetSeverity());
+			if (SevStr.IsEmpty()) continue;  // None は出さない
+			if (SeverityFilter.Num() > 0 && !SeverityFilter.Contains(SevStr)) continue;
+
+			TSharedRef<FJsonObject> IssueObj = MakeShared<FJsonObject>();
+
+			// emitter 名 (system 直下 issue は null)
+			const FString EmitterName = LookupEmitterName(Entry->GetEmitterViewModel());
+			if (EmitterName.IsEmpty())
+			{
+				IssueObj->SetField(TEXT("emitter"), MakeShared<FJsonValueNull>());
+			}
+			else
+			{
+				IssueObj->SetStringField(TEXT("emitter"), EmitterName);
+			}
+
+			// stage (parent chain の UNiagaraStackScriptItemGroup から、なければ module node の usage から fallback)
+			FString StageStr;
+			if (CurrentGroup)
+			{
+				StageStr = UsageToString(CurrentGroup->GetScriptUsage());
+			}
+			if (StageStr.IsEmpty())
+			{
+				if (UNiagaraStackModuleItem* ModItem = Cast<UNiagaraStackModuleItem>(Entry))
+				{
+					UNiagaraNodeFunctionCall& ModNode = ModItem->GetModuleNode();
+					if (UNiagaraScript* CalledScript = ModNode.FunctionScript)
+					{
+						StageStr = UsageToString(CalledScript->GetUsage());
+					}
+				}
+			}
+			if (StageStr.IsEmpty())
+			{
+				IssueObj->SetField(TEXT("stage"), MakeShared<FJsonValueNull>());
+			}
+			else
+			{
+				IssueObj->SetStringField(TEXT("stage"), StageStr);
+			}
+
+			// module / module_guid (UNiagaraStackModuleItem の場合のみ)
+			if (UNiagaraStackModuleItem* ModItem = Cast<UNiagaraStackModuleItem>(Entry))
+			{
+				UNiagaraNodeFunctionCall& ModNode = ModItem->GetModuleNode();
+				IssueObj->SetStringField(TEXT("module"), ModNode.GetFunctionName());
+				IssueObj->SetStringField(TEXT("module_guid"), ModNode.NodeGuid.ToString(EGuidFormats::Digits));
+			}
+			else
+			{
+				IssueObj->SetField(TEXT("module"), MakeShared<FJsonValueNull>());
+				IssueObj->SetField(TEXT("module_guid"), MakeShared<FJsonValueNull>());
+			}
+
+			IssueObj->SetStringField(TEXT("severity"), SevStr);
+			IssueObj->SetStringField(TEXT("short_description"), Issue.GetShortDescription().ToString());
+			IssueObj->SetStringField(TEXT("long_description"), Issue.GetLongDescription().ToString());
+			IssueObj->SetStringField(TEXT("unique_identifier"), Issue.GetUniqueIdentifier());
+
+			// fixes[] (description / fix_unique_identifier / style 必須、module_to_add / target_stage は Task 4)
+			TArray<TSharedPtr<FJsonValue>> FixValues;
+			const TArray<UNiagaraStackEntry::FStackIssueFix>& Fixes = Issue.GetFixes();
+			for (int32 i = 0; i < Fixes.Num(); ++i)
+			{
+				const UNiagaraStackEntry::FStackIssueFix& Fix = Fixes[i];
+				TSharedRef<FJsonObject> FixObj = MakeShared<FJsonObject>();
+				FixObj->SetNumberField(TEXT("index"), i);
+				const FString FixDescription = Fix.GetDescription().ToString();
+				FixObj->SetStringField(TEXT("description"), FixDescription);
+				FixObj->SetStringField(TEXT("fix_unique_identifier"), Fix.GetUniqueIdentifier());
+				FixObj->SetStringField(TEXT("style"), FixStyleToString(Fix.GetStyle()));
+
+				FString ModuleToAdd;
+				FString TargetStage;
+				const FString HintText = FString::Printf(TEXT("%s\n%s\n%s"),
+					*FixDescription,
+					*Issue.GetLongDescription().ToString(),
+					*Issue.GetShortDescription().ToString());
+				if (TryInferModuleFixHint(HintText, ModuleToAdd, TargetStage))
+				{
+					FixObj->SetStringField(TEXT("module_to_add"), ModuleToAdd);
+				}
+				else
+				{
+					FixObj->SetField(TEXT("module_to_add"), MakeShared<FJsonValueNull>());
+				}
+				if (!TargetStage.IsEmpty())
+				{
+					FixObj->SetStringField(TEXT("target_stage"), TargetStage);
+				}
+				else
+				{
+					FixObj->SetField(TEXT("target_stage"), MakeShared<FJsonValueNull>());
+				}
+				FixValues.Add(MakeShared<FJsonValueObject>(FixObj));
+			}
+			IssueObj->SetArrayField(TEXT("fixes"), FixValues);
+
+			IssueValues.Add(MakeShared<FJsonValueObject>(IssueObj));
+		}
+
+		TArray<UNiagaraStackEntry*> Children;
+		Entry->GetUnfilteredChildren(Children);
+		for (UNiagaraStackEntry* Child : Children)
+		{
+			Recurse(Child, CurrentGroup);
+		}
+	};
+	for (UNiagaraStackEntry* RootEntry : RootEntries)
+	{
+		Recurse(RootEntry, nullptr);
+	}
+
+	// ---- 5. build response ----
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("asset_path"), SystemPath);
+	R->SetNumberField(TEXT("issue_count"), IssueValues.Num());
+	R->SetArrayField(TEXT("issues"), IssueValues);
+	R->SetStringField(TEXT("caveat"),
+		TEXT("Issues are reported best-effort. This action opens the Niagara System Editor via AssetEditorSubsystem "
+		     "and walks the editor-owned stack view models because direct data-processing view models do not populate "
+		     "dependency validator issues reliably in UE 5.7. The editor tab may briefly appear and is closed again "
+		     "when this action opened it. "
+		     "The stack is refreshed once before collection; dependency analysis may still be incomplete. "
+		     "Re-run if the response seems incomplete, or open the asset in the Niagara System Editor to double-check."));
+
+	CloseEditorIfOpenedByThisAction();
 	return SuccessObj(R);
 }
 
