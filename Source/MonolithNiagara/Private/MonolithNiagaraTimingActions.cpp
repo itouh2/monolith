@@ -20,7 +20,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogMonolithNiagaraTiming, Log, All);
 //  Local file-static helpers (mirror MonolithNiagaraActions.cpp:686-705 pattern)
 // ============================================================================
 
-namespace MonolithNiagaraTimingLocal
+namespace MonolithNiagaraTimingActionsLocal
 {
 	static FMonolithActionResult SuccessStr(const FString& Msg)
 	{
@@ -29,12 +29,12 @@ namespace MonolithNiagaraTimingLocal
 		return FMonolithActionResult::Success(R);
 	}
 
-	static FMonolithActionResult SuccessObj(const TSharedRef<FJsonObject>& Obj)
+	static FMonolithActionResult TimingSuccessObj(const TSharedRef<FJsonObject>& Obj)
 	{
 		return FMonolithActionResult::Success(Obj);
 	}
 
-	static FString GetAssetPath(const TSharedPtr<FJsonObject>& Params)
+	static FString TimingGetAssetPath(const TSharedPtr<FJsonObject>& Params)
 	{
 		FString Path = Params->GetStringField(TEXT("asset_path"));
 		if (Path.IsEmpty()) Path = Params->GetStringField(TEXT("system_path"));
@@ -52,7 +52,7 @@ namespace MonolithNiagaraTimingLocal
 	}
 }
 
-using namespace MonolithNiagaraTimingLocal;
+using namespace MonolithNiagaraTimingActionsLocal;
 
 // ============================================================================
 //  Registration
@@ -154,7 +154,7 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetSystemTiming(const TSharedPtr<FJsonObject>& Params)
 {
-	const FString SystemPath = GetAssetPath(Params);
+	const FString SystemPath = TimingGetAssetPath(Params);
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
 
@@ -174,12 +174,12 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetSystemTiming(const
 	}
 	R->SetBoolField(TEXT("require_current_frame_data"), bRequireCurrent);
 
-	return SuccessObj(R);
+	return TimingSuccessObj(R);
 }
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetWarmupProfile(const TSharedPtr<FJsonObject>& Params)
 {
-	const FString SystemPath = GetAssetPath(Params);
+	const FString SystemPath = TimingGetAssetPath(Params);
 
 	// warmup_time required (per plan § Phase 1 spec)
 	TSharedPtr<FJsonValue> WarmupTimeJV = Params->TryGetField(TEXT("warmup_time"));
@@ -235,12 +235,12 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetWarmupProfile(cons
 	R->SetNumberField(TEXT("warmup_time"), System->GetWarmupTime());
 	R->SetNumberField(TEXT("warmup_tick_count"), System->GetWarmupTickCount());
 	R->SetNumberField(TEXT("warmup_tick_delta"), System->GetWarmupTickDelta());
-	return SuccessObj(R);
+	return TimingSuccessObj(R);
 }
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetFixedTickDelta(const TSharedPtr<FJsonObject>& Params)
 {
-	const FString SystemPath = GetAssetPath(Params);
+	const FString SystemPath = TimingGetAssetPath(Params);
 
 	// enabled required (bool)
 	TSharedPtr<FJsonValue> EnabledJV = Params->TryGetField(TEXT("enabled"));
@@ -298,12 +298,12 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetFixedTickDelta(con
 	R->SetStringField(TEXT("asset_path"), SystemPath);
 	R->SetBoolField(TEXT("fixed_tick_delta_enabled"), System->HasFixedTickDelta());
 	R->SetNumberField(TEXT("fixed_tick_delta_time"), System->GetFixedTickDeltaTime());
-	return SuccessObj(R);
+	return TimingSuccessObj(R);
 }
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetRequireCurrentFrameData(const TSharedPtr<FJsonObject>& Params)
 {
-	const FString SystemPath = GetAssetPath(Params);
+	const FString SystemPath = TimingGetAssetPath(Params);
 
 	TSharedPtr<FJsonValue> RequireJV = Params->TryGetField(TEXT("require"));
 	if (!RequireJV.IsValid() || RequireJV->Type != EJson::Boolean)
@@ -333,7 +333,7 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetRequireCurrentFram
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("asset_path"), SystemPath);
 	R->SetBoolField(TEXT("require_current_frame_data"), Prop->GetPropertyValue_InContainer(System));
-	return SuccessObj(R);
+	return TimingSuccessObj(R);
 }
 
 // ============================================================================
@@ -355,7 +355,7 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetRequireCurrentFram
 // (hazard §7 of the plan — sidestepped).
 //
 
-namespace MonolithNiagaraTimingLocal
+namespace MonolithNiagaraTimingActionsLocal
 {
 	// EmitterState canonical module name (Q2 of the design spec — accepted risk
 	// of 5.8+ rename, one-line code-change recovery).
@@ -759,7 +759,7 @@ namespace MonolithNiagaraTimingLocal
 		// UpdateContext destructor at scope exit triggers system re-init.
 		TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
 		Resp->SetBoolField(TEXT("success"), true);
-		Resp->SetStringField(TEXT("asset_path"), GetAssetPath(Params));
+		Resp->SetStringField(TEXT("asset_path"), TimingGetAssetPath(Params));
 		Resp->SetStringField(TEXT("emitter"), Params->GetStringField(TEXT("emitter")));
 		Resp->SetBoolField(TEXT("stateless"), true);
 		Resp->SetArrayField(TEXT("warnings"), OutWarnings);
@@ -883,13 +883,13 @@ namespace MonolithNiagaraTimingLocal
 
 		return EObj;
 	}
-} // namespace MonolithNiagaraTimingLocal
+} // namespace MonolithNiagaraTimingActionsLocal
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile(const TSharedPtr<FJsonObject>& Params)
 {
-	using namespace MonolithNiagaraTimingLocal;
+	using namespace MonolithNiagaraTimingActionsLocal;
 
-	const FString SystemPath = GetAssetPath(Params);
+	const FString SystemPath = TimingGetAssetPath(Params);
 	if (SystemPath.IsEmpty())
 		return FMonolithActionResult::Error(TEXT("Missing required field: asset_path"));
 
@@ -1077,14 +1077,14 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile
 	Resp->SetStringField(TEXT("asset_path"), SystemPath);
 	Resp->SetStringField(TEXT("emitter"), Emitter);
 	Resp->SetArrayField(TEXT("warnings"), Warnings);
-	return SuccessObj(Resp);
+	return TimingSuccessObj(Resp);
 }
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetEmitterTimingSummary(const TSharedPtr<FJsonObject>& Params)
 {
-	using namespace MonolithNiagaraTimingLocal;
+	using namespace MonolithNiagaraTimingActionsLocal;
 
-	const FString SystemPath = GetAssetPath(Params);
+	const FString SystemPath = TimingGetAssetPath(Params);
 	if (SystemPath.IsEmpty())
 		return FMonolithActionResult::Error(TEXT("Missing required field: asset_path"));
 
@@ -1106,7 +1106,7 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetEmitterTimingSumma
 			TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
 			Resp->SetStringField(TEXT("asset_path"), SystemPath);
 			Resp->SetArrayField(TEXT("emitters"), EmittersArr);
-			return SuccessObj(Resp);
+			return TimingSuccessObj(Resp);
 		}
 	}
 
@@ -1307,7 +1307,7 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetEmitterTimingSumma
 	TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
 	Resp->SetStringField(TEXT("asset_path"), SystemPath);
 	Resp->SetArrayField(TEXT("emitters"), EmittersArr);
-	return SuccessObj(Resp);
+	return TimingSuccessObj(Resp);
 }
 
 // ----------------------------------------------------------------------------
@@ -1321,7 +1321,7 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetEmitterTimingSumma
 // (same private-static cross-TU issue as Phase 1's LoadSystem). Registry
 // dispatch is schema-validated, single source of truth, zero duplication.
 //
-namespace MonolithNiagaraTimingLocal
+namespace MonolithNiagaraTimingActionsLocal
 {
 	// Build the JSON envelope set_simulation_stage_property expects:
 	//   { asset_path, emitter, stage_index?, stage_name?, property, value }
@@ -1332,8 +1332,8 @@ namespace MonolithNiagaraTimingLocal
 		const TSharedPtr<FJsonValue>& Value)
 	{
 		// Forward asset_path / system_path (canonical handler reads asset_path; the
-		// upstream GetAssetPath also accepts system_path so either works).
-		const FString SystemPath = GetAssetPath(Params);
+		// upstream TimingGetAssetPath also accepts system_path so either works).
+		const FString SystemPath = TimingGetAssetPath(Params);
 		if (SystemPath.IsEmpty())
 			return FMonolithActionResult::Error(TEXT("Missing required field: asset_path"));
 
@@ -1387,7 +1387,7 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetSimStageIterationC
 		return FMonolithActionResult::Error(TEXT("iterations must be >= 0"));
 
 	TSharedPtr<FJsonValue> Value = MakeShared<FJsonValueString>(FString::Printf(TEXT("(Value=%d)"), Iterations));
-	return MonolithNiagaraTimingLocal::DispatchSimStageAlias(Params, TEXT("NumIterations"), Value);
+	return MonolithNiagaraTimingActionsLocal::DispatchSimStageAlias(Params, TEXT("NumIterations"), Value);
 }
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetSimStageExecuteBehavior(const TSharedPtr<FJsonObject>& Params)
@@ -1401,14 +1401,14 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetSimStageExecuteBeh
 		return FMonolithActionResult::Error(TEXT("Missing required field: behavior (string: 'Always' | 'OnSimulationReset' | 'NotOnSimulationReset')"));
 
 	TSharedPtr<FJsonValue> Value = MakeShared<FJsonValueString>(Behavior);
-	return MonolithNiagaraTimingLocal::DispatchSimStageAlias(Params, TEXT("ExecuteBehavior"), Value);
+	return MonolithNiagaraTimingActionsLocal::DispatchSimStageAlias(Params, TEXT("ExecuteBehavior"), Value);
 }
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetParticleLifetime(const TSharedPtr<FJsonObject>& Params)
 {
-	using namespace MonolithNiagaraTimingLocal;
+	using namespace MonolithNiagaraTimingActionsLocal;
 
-	const FString SystemPath = GetAssetPath(Params);
+	const FString SystemPath = TimingGetAssetPath(Params);
 	if (SystemPath.IsEmpty())
 		return FMonolithActionResult::Error(TEXT("Missing required field: asset_path"));
 
@@ -1520,5 +1520,5 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetParticleLifetime(c
 	{
 		Resp->SetNumberField(TEXT("lifetime"), MinValue);
 	}
-	return SuccessObj(Resp);
+	return TimingSuccessObj(Resp);
 }
