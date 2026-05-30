@@ -128,7 +128,7 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 		FParamSchemaBuilder()
 			.Required(TEXT("location"), TEXT("object"), TEXT("World position {x, y, z} or [x, y, z]"))
 			.Required(TEXT("extent"), TEXT("object"), TEXT("Half-extents {x, y, z} or [x, y, z]"))
-			.Optional(TEXT("folder_path"), TEXT("string"), TEXT("Outliner folder path (default: AI/Navigation)"))
+			.OptionalAssetPath(TEXT("folder_path"), TEXT("Outliner folder path (default: AI/Navigation)"))
 			.Build());
 
 	// 148. list_nav_bounds_volumes
@@ -160,7 +160,7 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 		TEXT("Create a new UNavArea Blueprint with custom cost and color"),
 		FMonolithActionHandler::CreateStatic(&HandleCreateNavArea),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Package path, e.g. /Game/AI/NavArea_Water"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Package path, e.g. /Game/AI/NavArea_Water"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Asset name"))
 			.Optional(TEXT("default_cost"), TEXT("number"), TEXT("Default traversal cost (default: 1.0)"))
 			.Optional(TEXT("fixed_area_entering_cost"), TEXT("number"), TEXT("Fixed cost applied once when entering the area (default: 0.0)"))
@@ -175,7 +175,7 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Required(TEXT("location"), TEXT("object"), TEXT("World position {x, y, z} or [x, y, z]"))
 			.Required(TEXT("extent"), TEXT("object"), TEXT("Half-extents {x, y, z} or [x, y, z]"))
 			.Required(TEXT("area_class"), TEXT("string"), TEXT("Nav area class name (e.g. NavArea_Null, NavArea_Obstacle, or custom)"))
-			.Optional(TEXT("folder_path"), TEXT("string"), TEXT("Outliner folder path (default: AI/Navigation)"))
+			.OptionalAssetPath(TEXT("folder_path"), TEXT("Outliner folder path (default: AI/Navigation)"))
 			.Build());
 
 	// 154. add_nav_link_proxy
@@ -187,7 +187,7 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Required(TEXT("end_location"), TEXT("object"), TEXT("End point {x, y, z} or [x, y, z]"))
 			.Optional(TEXT("link_type"), TEXT("string"), TEXT("'point' (default) or 'smart'"))
 			.Optional(TEXT("area_class"), TEXT("string"), TEXT("Nav area class for the link"))
-			.Optional(TEXT("folder_path"), TEXT("string"), TEXT("Outliner folder path (default: AI/Navigation)"))
+			.OptionalAssetPath(TEXT("folder_path"), TEXT("Outliner folder path (default: AI/Navigation)"))
 			.Build());
 
 	// 155. configure_nav_link
@@ -195,7 +195,7 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 		TEXT("Configure an existing ANavLinkProxy: enable/disable, set area class, direction"),
 		FMonolithActionHandler::CreateStatic(&HandleConfigureNavLink),
 		FParamSchemaBuilder()
-			.Required(TEXT("actor_path"), TEXT("string"), TEXT("Actor name, label, or path in the level"))
+			.RequiredAssetPath(TEXT("actor_path"), TEXT("Actor name, label, or path in the level"))
 			.Optional(TEXT("enabled"), TEXT("boolean"), TEXT("Enable or disable the link"))
 			.Optional(TEXT("area_class"), TEXT("string"), TEXT("Nav area class for the link"))
 			.Optional(TEXT("direction"), TEXT("string"), TEXT("'both' (bidirectional), 'left_to_right', or 'right_to_left'"))
@@ -270,7 +270,7 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 		TEXT("Add UNavigationInvokerComponent to a Blueprint for dynamic nav generation around the actor"),
 		FMonolithActionHandler::CreateStatic(&HandleAddNavInvokerComponent),
 		FParamSchemaBuilder()
-			.Required(TEXT("blueprint_path"), TEXT("string"), TEXT("Actor Blueprint asset path"))
+			.RequiredAssetPath(TEXT("blueprint_path"), TEXT("Actor Blueprint asset path"))
 			.Optional(TEXT("generation_radius"), TEXT("number"), TEXT("Nav generation radius (cm, default: 3000)"))
 			.Optional(TEXT("removal_radius"), TEXT("number"), TEXT("Nav removal radius (cm, default: 5000)"))
 			.Build());

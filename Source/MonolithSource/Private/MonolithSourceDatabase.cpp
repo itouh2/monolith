@@ -120,8 +120,26 @@ bool FMonolithSourceDatabase::Open(const FString& DbPath)
 		return false;
 	}
 
-	// Force DELETE journal mode — WAL breaks ReadOnly on Windows
-	Database->Execute(TEXT("PRAGMA journal_mode=DELETE;"));
+	// Force DELETE journal mode on EVERY open. This keeps the file free of
+	// -wal/-shm sidecars at rest — tidy, and defensive idempotency in case a
+	// prior session crashed mid-WAL or another tool flipped it back.
+	//
+	// NOTE (corrected 2026-05-29): an earlier theory blamed Reflection
+	// Intelligence's "disk I/O error" on WAL+ReadOnly cross-process replay. That
+	// was WRONG — this DB is in DELETE mode (no WAL involved) and the failure was
+	// SAME-process, not cross-process. The real cause was a second open of this
+	// same file by MonolithReflectionIntel: UE 5.7's custom `unreal-fs` SQLite VFS
+	// permits only ONE open of a file per process and reserves a write handle even
+	// for a "ReadOnly" open, so the second open returned SQLITE_IOERR. The fix is
+	// to STOP the second open — RI now borrows this handle via GetRawHandle().
+	// The journal_mode flip remains for hygiene only; it is no longer load-bearing
+	// for RI access.
+	if (!Database->Execute(TEXT("PRAGMA journal_mode=DELETE;")))
+	{
+		UE_LOG(LogMonolithSource, Warning,
+			TEXT("Open: PRAGMA journal_mode=DELETE failed on '%s' (continuing — hygiene only)"),
+			*DbPath);
+	}
 
 	UE_LOG(LogMonolithSource, Log, TEXT("Engine source DB opened: %s"), *DbPath);
 	return true;
@@ -142,6 +160,16 @@ bool FMonolithSourceDatabase::IsOpen() const
 {
 	FScopeLock Lock(&DbLock);
 	return Database != nullptr && Database->IsValid();
+}
+
+FSQLiteDatabase* FMonolithSourceDatabase::GetRawHandle() const
+{
+	// Deliberately NOT locked here: the borrower (MonolithReflectionIntel) holds
+	// GetLock() across the whole fetch-prepare-step sequence, so taking DbLock
+	// here too would either deadlock (non-recursive FCriticalSection) or give a
+	// false sense of safety for a pointer that outlives this call. Return the
+	// raw pointer only when the handle is genuinely open; the borrower locks.
+	return (Database != nullptr && Database->IsValid()) ? Database : nullptr;
 }
 
 // ============================================================
@@ -732,6 +760,148 @@ TArray<FMonolithSourceSymbol> FMonolithSourceDatabase::SearchSymbolsFTSFiltered(
 }
 
 // ============================================================
+// FTS COUNT(*) helpers (Survivor E — plan §3.E)
+//
+// Issued ONLY on page 0 of cursor-paginated search_source. Mirrors the
+// JOIN / WHERE clauses of SearchSymbolsFTSFiltered / SearchSourceFTSFiltered
+// so the COUNT matches what the paged result would surface across the full
+// rerun. ORDER BY / LIMIT are intentionally omitted — COUNT short-circuits.
+// ============================================================
+
+int32 FMonolithSourceDatabase::CountSymbolsFTSFiltered(const FString& Query, const FString& Kind, const FString& Module, const FString& PathFilter)
+{
+	FScopeLock Lock(&DbLock);
+	if (!Database || !Database->IsValid()) return 0;
+
+	const FString FTSQuery = EscapeFTS(Query);
+
+	FString SQL = TEXT("SELECT COUNT(*) FROM symbols_fts f JOIN symbols s ON s.id = f.rowid ");
+	TArray<FString> Conditions;
+	Conditions.Add(TEXT("symbols_fts MATCH ?"));
+
+	if (!Module.IsEmpty() || !PathFilter.IsEmpty())
+	{
+		SQL += TEXT("JOIN files fi ON fi.id = s.file_id ");
+	}
+	if (!Module.IsEmpty())
+	{
+		SQL += TEXT("JOIN modules m ON m.id = fi.module_id ");
+		Conditions.Add(TEXT("m.name = ?"));
+	}
+	if (!Kind.IsEmpty())
+	{
+		Conditions.Add(TEXT("s.kind = ?"));
+	}
+	if (!PathFilter.IsEmpty())
+	{
+		Conditions.Add(TEXT("fi.path LIKE ?"));
+	}
+
+	SQL += TEXT("WHERE ") + FString::Join(Conditions, TEXT(" AND "));
+	SQL += TEXT(";");
+
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(*Database, *SQL);
+
+	int32 BindIdx = 1;
+	Stmt.SetBindingValueByIndex(BindIdx++, FTSQuery);
+	if (!Module.IsEmpty())
+	{
+		Stmt.SetBindingValueByIndex(BindIdx++, Module);
+	}
+	if (!Kind.IsEmpty())
+	{
+		Stmt.SetBindingValueByIndex(BindIdx++, Kind);
+	}
+	if (!PathFilter.IsEmpty())
+	{
+		Stmt.SetBindingValueByIndex(BindIdx++, FString::Printf(TEXT("%%%s%%"), *PathFilter));
+	}
+
+	int32 Count = 0;
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		int64 C64 = 0;
+		Stmt.GetColumnValueByIndex(0, C64);
+		Count = static_cast<int32>(C64);
+	}
+	return Count;
+}
+
+int32 FMonolithSourceDatabase::CountSourceFTSFiltered(const FString& Query, const FString& Scope, const FString& Module, const FString& PathFilter)
+{
+	FScopeLock Lock(&DbLock);
+	if (!Database || !Database->IsValid()) return 0;
+
+	const FString FTSQuery = EscapeFTS(Query);
+
+	// Fast path: no joins needed when neither module nor path filter is set
+	// AND scope is "all" — single FTS COUNT(*).
+	if (Scope == TEXT("all") && Module.IsEmpty() && PathFilter.IsEmpty())
+	{
+		FSQLitePreparedStatement Stmt;
+		Stmt.Create(*Database, TEXT("SELECT COUNT(*) FROM source_fts WHERE source_fts MATCH ?;"));
+		Stmt.SetBindingValueByIndex(1, FTSQuery);
+
+		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			int64 C64 = 0;
+			Stmt.GetColumnValueByIndex(0, C64);
+			return static_cast<int32>(C64);
+		}
+		return 0;
+	}
+
+	FString SQL = TEXT("SELECT COUNT(*) FROM source_fts sf JOIN files fi ON fi.id = sf.file_id ");
+	TArray<FString> Conditions;
+	Conditions.Add(TEXT("source_fts MATCH ?"));
+
+	if (!Module.IsEmpty())
+	{
+		SQL += TEXT("JOIN modules m ON m.id = fi.module_id ");
+		Conditions.Add(TEXT("m.name = ?"));
+	}
+	if (Scope != TEXT("all"))
+	{
+		Conditions.Add(TEXT("fi.file_type = ?"));
+	}
+	if (!PathFilter.IsEmpty())
+	{
+		Conditions.Add(TEXT("fi.path LIKE ?"));
+	}
+
+	SQL += TEXT("WHERE ") + FString::Join(Conditions, TEXT(" AND "));
+	SQL += TEXT(";");
+
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(*Database, *SQL);
+
+	int32 BindIdx = 1;
+	Stmt.SetBindingValueByIndex(BindIdx++, FTSQuery);
+	if (!Module.IsEmpty())
+	{
+		Stmt.SetBindingValueByIndex(BindIdx++, Module);
+	}
+	if (Scope != TEXT("all"))
+	{
+		Stmt.SetBindingValueByIndex(BindIdx++, Scope);
+	}
+	if (!PathFilter.IsEmpty())
+	{
+		Stmt.SetBindingValueByIndex(BindIdx++, FString::Printf(TEXT("%%%s%%"), *PathFilter));
+	}
+
+	int32 Count = 0;
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		int64 C64 = 0;
+		Stmt.GetColumnValueByIndex(0, C64);
+		Count = static_cast<int32>(C64);
+	}
+	return Count;
+}
+
+// ============================================================
 // Write API — OpenForWriting
 // ============================================================
 
@@ -757,8 +927,20 @@ bool FMonolithSourceDatabase::OpenForWriting(const FString& DbPath)
 		return false;
 	}
 
-	// Belt-and-suspenders: force DELETE journal mode (WAL breaks ReadOnly on Windows, per lesson learned)
-	Database->Execute(TEXT("PRAGMA journal_mode=DELETE;"));
+	// Force DELETE journal mode on the writer handle so the DB persists in DELETE
+	// mode at rest (no -wal/-shm sidecars). NOTE (corrected 2026-05-29): this is
+	// hygiene, NOT the fix for Reflection Intelligence's "disk I/O error" x25 —
+	// that was a SAME-process double-open rejected by UE 5.7's single-open
+	// `unreal-fs` VFS, now resolved by RI borrowing the subsystem's open handle
+	// (FMonolithSourceDatabase::GetRawHandle) rather than opening its own. We keep
+	// the return-value check because a journal-mode failure here is still worth a
+	// visible warning.
+	if (!Database->Execute(TEXT("PRAGMA journal_mode=DELETE;")))
+	{
+		UE_LOG(LogMonolithSource, Warning,
+			TEXT("OpenForWriting: PRAGMA journal_mode=DELETE failed on '%s' (continuing — hygiene only)"),
+			*DbPath);
+	}
 	Database->Execute(TEXT("PRAGMA synchronous=NORMAL;"));
 	Database->Execute(TEXT("PRAGMA cache_size=-64000;"));   // 64 MB page cache
 

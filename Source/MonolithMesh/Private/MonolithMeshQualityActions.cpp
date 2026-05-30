@@ -55,7 +55,7 @@ void FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry& Registr
 		TEXT("Scan assets by path and flag names not matching prefix conventions (SM_ for StaticMesh, SK_ for SkeletalMesh, M_ for Material, MI_ for MaterialInstance, T_ for Texture, BP_ for Blueprint). Supports custom rules."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshQualityActions::ValidateNamingConventions),
 		FParamSchemaBuilder()
-			.Optional(TEXT("scan_path"), TEXT("string"), TEXT("Content path to scan (e.g. /Game/Environment)"), TEXT("/Game"))
+			.OptionalAssetPathWithDefault(TEXT("scan_path"), TEXT("Content path to scan (e.g. /Game/Environment)"), TEXT("/Game"))
 			.Optional(TEXT("max_results"), TEXT("integer"), TEXT("Maximum violations to return"), TEXT("100"))
 			.Optional(TEXT("custom_rules"), TEXT("object"), TEXT("Custom prefix rules: {\"ClassName\": \"Prefix_\", ...}"))
 			.Build());
@@ -81,7 +81,7 @@ void FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry& Registr
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshQualityActions::GenerateProxyMesh),
 		FParamSchemaBuilder()
 			.Required(TEXT("actor_names"), TEXT("array"), TEXT("Array of actor names to merge"))
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for saved mesh (e.g. /Game/Merged/MyProxy)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for saved mesh (e.g. /Game/Merged/MyProxy)"))
 			.Optional(TEXT("screen_size"), TEXT("integer"), TEXT("Screen size for proxy (pixels)"), TEXT("300"))
 			.Optional(TEXT("merge_materials"), TEXT("boolean"), TEXT("Merge materials into atlas"), TEXT("true"))
 			.Optional(TEXT("texture_size"), TEXT("integer"), TEXT("Merged material texture size"), TEXT("1024"))
@@ -92,7 +92,7 @@ void FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry& Registr
 		TEXT("Create or configure a UHLODLayer asset with type and settings."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshQualityActions::SetupHlod),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for HLOD layer (e.g. /Game/HLOD/MyLayer)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for HLOD layer (e.g. /Game/HLOD/MyLayer)"))
 			.Optional(TEXT("layer_type"), TEXT("string"), TEXT("HLOD type: MeshMerge, MeshSimplify, MeshApproximate, Custom"), TEXT("MeshSimplify"))
 			.Optional(TEXT("cell_size"), TEXT("integer"), TEXT("HLOD cell size in world units"), TEXT("25600"))
 			.Optional(TEXT("loading_range"), TEXT("number"), TEXT("Loading range multiplier"), TEXT("2.0"))
@@ -103,7 +103,7 @@ void FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry& Registr
 		TEXT("Analyze texture memory usage: pool size, used, top textures, by-format breakdown. Identifies budget hogs and gives recommendations."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshQualityActions::AnalyzeTextureBudget),
 		FParamSchemaBuilder()
-			.Optional(TEXT("scan_path"), TEXT("string"), TEXT("Content path filter (empty = all)"), TEXT(""))
+			.OptionalAssetPath(TEXT("scan_path"), TEXT("Content path filter (empty = all)"))
 			.Optional(TEXT("top_count"), TEXT("integer"), TEXT("Number of top textures to return"), TEXT("20"))
 			.Build());
 
