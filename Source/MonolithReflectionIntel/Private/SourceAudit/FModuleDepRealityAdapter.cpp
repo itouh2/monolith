@@ -17,6 +17,8 @@
 
 #include "SourceAudit/FModuleDepRealityAdapter.h"
 #include "MonolithReflectionIntelModule.h"
+#include "Shared/RICursorCodec.h"
+#include "Shared/RIPathUtils.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -36,57 +38,10 @@
 
 namespace
 {
-	// ---------------------------------------------------------------------
-	// Cursor codec — mirror of FRiskQueryAdapter's anonymous codec. A shared
-	// MonolithCore helper would be cleaner; consolidation is Phase 5+ work.
-	// ---------------------------------------------------------------------
-	struct FAuditCursorState
-	{
-		uint32 QueryHash = 0;
-		int32  Page = 0;
-		int32  CachedTotalEstimate = -1;
-	};
-
-	FString EncodeCursor(const FAuditCursorState& S)
-	{
-		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
-		O->SetNumberField(TEXT("qh"), static_cast<double>(S.QueryHash));
-		O->SetNumberField(TEXT("p"),  S.Page);
-		O->SetNumberField(TEXT("tc"), S.CachedTotalEstimate);
-		FString Js;
-		TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Js);
-		FJsonSerializer::Serialize(O.ToSharedRef(), W);
-		return FBase64::Encode(Js);
-	}
-
-	bool DecodeCursor(const FString& Enc, FAuditCursorState& Out)
-	{
-		Out = FAuditCursorState();
-		if (Enc.IsEmpty()) { return false; }
-		FString Js;
-		if (!FBase64::Decode(Enc, Js)) { return false; }
-		TSharedPtr<FJsonObject> O;
-		TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(Js);
-		if (!FJsonSerializer::Deserialize(R, O) || !O.IsValid()) { return false; }
-		double Qh = 0.0, P = 0.0, Tc = -1.0;
-		if (!O->TryGetNumberField(TEXT("qh"), Qh)) { return false; }
-		if (!O->TryGetNumberField(TEXT("p"),  P))  { return false; }
-		if (!O->TryGetNumberField(TEXT("tc"), Tc)) { return false; }
-		if (P < 0.0) { return false; }
-		if (Qh < 0.0 || Qh > static_cast<double>(TNumericLimits<uint32>::Max())) { return false; }
-		Out.QueryHash = static_cast<uint32>(Qh);
-		Out.Page = static_cast<int32>(P);
-		Out.CachedTotalEstimate = static_cast<int32>(Tc);
-		return true;
-	}
-
-	FMonolithActionResult InvalidCursorError(const FString& Reason)
-	{
-		TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
-		Data->SetStringField(TEXT("error_code"), TEXT("INVALID_CURSOR"));
-		return FMonolithActionResult::Error(Reason, FMonolithJsonUtils::ErrInvalidParams)
-			.WithErrorData(Data);
-	}
+	// Cursor codec hoisted to Private/Shared/RICursorCodec.{h,cpp} to avoid
+	// unity-build collisions across the six query adapters. See that header for
+	// rationale. Wire format / behaviour unchanged. (This adapter never defined
+	// a ComputeFilterHash.)
 
 	/** Implicit-in-every-UE-module deps that never need to be listed explicitly. */
 	const TSet<FString>& ImplicitModules()
@@ -128,20 +83,9 @@ namespace
 		TSet<FString> DeclaredDeps;   // Public + Private DependencyModuleNames union
 	};
 
-	FString ToProjectRelative(const FString& AbsPath, const FString& ProjectRoot)
-	{
-		FString Full = FPaths::ConvertRelativePathToFull(AbsPath);
-		FString RootFull = FPaths::ConvertRelativePathToFull(ProjectRoot);
-		Full.ReplaceInline(TEXT("\\"), TEXT("/"));
-		RootFull.ReplaceInline(TEXT("\\"), TEXT("/"));
-		if (Full.StartsWith(RootFull, ESearchCase::IgnoreCase))
-		{
-			FString Rel = Full.Mid(RootFull.Len());
-			while (!Rel.IsEmpty() && Rel[0] == TEXT('/')) { Rel.RightChopInline(1); }
-			return Rel;
-		}
-		return Full;
-	}
+	// ToProjectRelative hoisted to Private/Shared/RIPathUtils.{h,cpp}
+	// (RIToProjectRelative) to avoid unity-build collisions across the three
+	// indexers that carried a byte-identical copy. Behaviour unchanged.
 
 	/**
 	 * Parse a `.Build.cs` file and extract:
@@ -292,14 +236,14 @@ FMonolithActionResult FModuleDepRealityAdapter::HandleAuditModuleDepReality(cons
 	int32 Page = 0;
 	if (!CursorIn.IsEmpty())
 	{
-		FAuditCursorState State;
-		if (!DecodeCursor(CursorIn, State))
+		FRICursorState State;
+		if (!DecodeRICursor(CursorIn, State))
 		{
-			return InvalidCursorError(TEXT("Cursor decode failed; restart pagination without `cursor`."));
+			return RIInvalidCursorError(TEXT("Cursor decode failed; restart pagination without `cursor`."));
 		}
 		if (State.QueryHash != FilterHash)
 		{
-			return InvalidCursorError(TEXT("Cursor filter mismatch; restart pagination without `cursor`."));
+			return RIInvalidCursorError(TEXT("Cursor filter mismatch; restart pagination without `cursor`."));
 		}
 		Page = State.Page;
 	}
@@ -468,7 +412,7 @@ FMonolithActionResult FModuleDepRealityAdapter::HandleAuditModuleDepReality(cons
 					if (Mod.DeclaredDeps.Contains(OwningModule)) { continue; }
 
 					FViolationRow V2;
-					V2.File = ToProjectRelative(SrcFile, ProjectRoot);
+					V2.File = RIToProjectRelative(SrcFile, ProjectRoot);
 					V2.Line = i + 1;
 					V2.Symbol = Candidate;
 					V2.ExpectedModule = OwningModule;
@@ -519,11 +463,11 @@ FMonolithActionResult FModuleDepRealityAdapter::HandleAuditModuleDepReality(cons
 
 	if (EndIdxExcl < Total)
 	{
-		FAuditCursorState OutCursor;
+		FRICursorState OutCursor;
 		OutCursor.QueryHash = FilterHash;
 		OutCursor.Page = Page + 1;
 		OutCursor.CachedTotalEstimate = Total;
-		Out->SetStringField(TEXT("next_cursor"), EncodeCursor(OutCursor));
+		Out->SetStringField(TEXT("next_cursor"), EncodeRICursor(OutCursor));
 	}
 	return FMonolithActionResult::Success(Out);
 }
