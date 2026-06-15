@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.18.1 (Beta)
+**Version:** 0.20.1 (Beta)
 
 ---
 
@@ -14,22 +14,23 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers ~115 blueprint actions (count approximate — query `monolith_discover("blueprint")` for the live figure) |
+| `FMonolithBlueprintModule` | Registers ~120 blueprint actions (count approximate — query `monolith_discover("blueprint")` for the live figure; includes the 2026-06-10 `find_variable_references`, Gap 5) |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
+| `FMonolithBlueprintContractActions` | Variable-contract reconciliation: `compare_class_variable_contract` (diff engine) + `promote_variables_to_parent`. Pin-type-aware descriptor extraction shared by both. |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
 > **Unity-safe file-local helpers (#68).** Internal-linkage helpers (anonymous-namespace functions/types, file-`static`s) must carry file-unique names or live in per-file named namespaces — matching the MonolithUI model — so they don't collide when adaptive/full unity concatenates same-module `.cpp`s into one translation unit. (The previously-global `InterpModeToString` in `MonolithBlueprintNodeActions.cpp` is now `NodeInterpModeToString`.)
 
-### Actions (~115 — namespace: "blueprint")
+### Actions (~120 — namespace: "blueprint")
 
 > **Per-module baseline note (2026-05-23):** this file's baseline was 92 (it carries the 2026-05-22 `add_property_access` +1 but predates the Phase 2 `override_parent_function` / `save_dirty_assets` +2 that SPEC_CORE §12 already folded into its authoritative 94). Part B adds +17 (dataset ergonomics, below), so this file's count moves 92 → 109 while §12's authoritative `blueprint` row moves 94 → 111. The residual 2-action gap (this file's 109 vs §12's 111) is the pre-existing Phase 2 drift §12's reconciliation notes already track — deferred to the next holistic count-audit, not patched here.
 
-**Read Actions (14)**
+**Read Actions (15)**
 | Action | Params | Description |
 |--------|--------|-------------|
-| `list_graphs` | `asset_path` | List all graphs with name/type/node_count. Graph types: event_graph, function, macro, delegate_signature |
+| `list_graphs` | `asset_path` | List all graphs with name/type/node_count. Graph types: event_graph, function, macro, delegate_signature. **(2026-06-10, Gap 7):** also appends interface-implementation graphs (from `ImplementedInterfaces[].Graphs`) flagged `graph_type: interface`, each carrying an `interface` field naming the implemented interface for disambiguation. |
 | `get_graph_summary` | `asset_path`, `graph_name` | Lightweight graph overview: node id/class/title + exec connections only (~10KB vs 172KB for full data) |
-| `get_graph_data` | `asset_path`, `graph_name`, `node_class_filter` | Full graph with all nodes, pins (17+ type categories), connections, positions. Optional class filter |
+| `get_graph_data` | `asset_path`, `graph_name`, `node_class_filter` | Full graph with all nodes, pins (17+ type categories), connections, positions. Optional class filter. **(2026-06-10, Gap 7):** `graph_name` now also resolves against interface-implementation graphs (same fix in `export_graph`, which shares `FindGraphByName`), so an interface function graph is dumpable by name instead of returning "Graph not found". |
 | `get_variables` | `asset_path`, `include_bind_widgets?` | All NewVariables: name, type (with container prefix), default (from CDO), category, flags (editable, read_only, expose_on_spawn, replicated, transient). When `include_bind_widgets=true` (Phase 3, 2026-05-23) the response carries a `bind_widgets` array enumerating BOTH (a) C++ `BindWidget`/`BindWidgetOptional` references (`source=bind_widget_meta`, `is_bind_widget=true`) AND (b) pure-Blueprint tree widgets exposed as variables / `UWidget::bIsVariable==true` (`source=tree_variable`, `is_bind_widget=false`); entry fields are `name`, `widget_class`, `optional`, `category`, `source`, `is_bind_widget`. Deduped — a tree widget that is also a C++ BindWidget property is reported once as `bind_widget_meta`. |
 | `get_cdo_properties` | `asset_path`, `category_filter?`, `include_parent_defaults?`, `owner_class_filter?`, `name_pattern?`, `exclude_categories?` | Reflects all CDO properties of a Blueprint class with current default values. Optional filters compose: `category_filter` (case-insensitive substring on `Category` metadata), `include_parent_defaults` (bool, walks parent CDO chain), `owner_class_filter` (case-insensitive substring on owner class name — skips inherited `AActor`/`APawn`/`ACharacter` in one parameter, PR #57), `name_pattern` (case-insensitive substring on property name, PR #57), `exclude_categories` (string array, case-insensitive exact match against `Category` — e.g. `["Replication", "Cooking", "HLOD"]`, PR #57). All filter params default to `null`/empty (no-op). Cuts JSON payload by ~90% in typical AActor-subclass inspection flows. |
 | `get_execution_flow` | `asset_path`, `entry_point` | Linearized exec trace from entry point. Handles branching (multiple exec outputs). MaxDepth=100 |
@@ -41,6 +42,9 @@
 | `get_parent_class` | `asset_path` | Return the parent class of the Blueprint |
 | `get_interfaces` | `asset_path` | List all implemented interfaces |
 | `get_construction_script` | `asset_path` | Get the construction script graph |
+| `find_variable_references` | `asset_path`, `variable_name`, `include_inherited?` | **(2026-06-10, Gap 5):** Find every graph node that reads or writes a Blueprint member variable. Walks all graphs (event graphs, functions, macros, delegate signatures, and interface-implementation graphs) and calls the engine's `UK2Node::ReferencesVariable` against the generated class. Per match, `access` is classified: `read` (a VariableGet), `write` (a VariableSet), `read` for a thread-safe Property Access node whose path resolves to the variable, or `other` (transition rules, split-struct pins, etc.). Each entry returns `graph`, `graph_type`, `node_id`, `node_title`, `access`; Property Access matches additionally carry a `property_access` path block. A `summary` object reports total/reads/writes/other counts. `include_inherited=true` also matches the variable where it is scoped to a parent class (default false). v1 covers member variables only — local function variables are out of scope. |
+
+> **PropertyAccess node paths in the read serializers (2026-06-10, Gap 1).** The shared K2 node serializer (`MonolithBlueprintInternal::SerializeNode`, used by `get_node_details` / `get_graph_data` / `export_graph`) and the anim-graph serializer (`animation::get_nodes` `include_anim_graph` path) now emit an additive `property_access` block on `K2Node_PropertyAccess` nodes: the resolved `path` array + dotted `text_path`, plus `context_id` and the resolved pin type. The node class is engine-private (`MinimalAPI`, unlinkable), so the fields are read via `FProperty` reflection — the read-side mirror of the existing `add_property_access` write — and degrade gracefully (`resolved: false` / omitted fields) if the engine layout changes. No new action.
 
 **Variable CRUD (7)**
 | Action | Params | Description |
@@ -52,6 +56,15 @@
 | `set_variable_defaults` | `asset_path`, `variable_name`, `default_value` | Set a variable's default value |
 | `add_local_variable` | `asset_path`, `function_name`, `variable_name`, `variable_type` | Add a local variable inside a function graph |
 | `remove_local_variable` | `asset_path`, `function_name`, `variable_name` | Remove a local variable from a function graph |
+
+**Variable Contract Reconciliation (2) — `MonolithBlueprintContractActions.cpp`**
+
+Reconcile the member-variable surface of one class against another by name + type + container kind + enum/struct subtype. Aimed at Blueprint→C++ migration, where a variable set must be promoted onto a native parent contract without breaking the bindings the AnimGraph / chooser / PropertyAccess pins compare against.
+
+| Action | Params | Description |
+|--------|--------|-------------|
+| `compare_class_variable_contract` | `left`, `right`, `include_inherited?`, `variables?` | Pure read/report diff of two classes' variable contracts. Each side is a Blueprint asset path (`/Game/...` → `GeneratedClass`) or a native class name (resolved as-is, with U/A prefix added/stripped, or a full `/Script/...` path). Per-variable descriptor reports `base_type`, `container` (`scalar`/`Array`/`Set`/`Map`), `enum_subtype` (UEnum path), `struct_subtype` (UScriptStruct path), `object_class`, `map_value_type`, and presence on each side; the `mismatch` classification is one of `ok`, `missing-on-left`, `missing-on-right`, `type-mismatch`, `container-mismatch`, `enum-subtype-mismatch`, `struct-subtype-mismatch`. For a Blueprint side, descriptors are sourced from the **authoritative `FEdGraphPinType`** of `NewVariables` (overlaying the compiled-FProperty walk) — the KismetCompiler can lower a UserDefinedEnum pin to a plain `FIntProperty` on the generated class, and a BP variable that shadows a native parent property does not materialize as a direct generated-class property; the pin-type overlay catches both. Struct/enum identity is compared by `GetPathName()` (BP pins compare struct types by exact `UScriptStruct` pointer identity). Mutates nothing. |
+| `promote_variables_to_parent` | `asset_path`, `variables`, `mode?` (`verify` default / `remove_shadowed`) | Reconcile a Blueprint's named local variables against its **native parent class** contract (the parent is resolved by walking up the `ClassGeneratedBy` chain to the first native class). `verify`: per-variable `status` = `parent-satisfies` (parent already declares a name+type+container+enum/struct-compatible counterpart) / `parent-declares-but-mismatch` / `parent-missing`. Authors no C++ — it produces the authoritative delta that a hand-written/native header must satisfy, then re-verifies post-build. `remove_shadowed`: deletes the now-redundant BP-local duplicate (`FBlueprintEditorUtils::RemoveMemberVariable`) ONLY for variables that pass parity AND are genuinely BP-local member variables (present in `NewVariables`); never removes a variable the parent lacks or declares incompatibly. Reports `will_remove` / `remove_skipped_reason` per variable and a `summary{requested,parent_satisfies,not_satisfied,removed_shadowed}`. |
 
 **Component CRUD (6)**
 | Action | Params | Description |

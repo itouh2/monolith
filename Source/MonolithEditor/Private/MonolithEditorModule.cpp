@@ -1,6 +1,10 @@
 #include "MonolithEditorModule.h"
 #include "MonolithEditorActions.h"
 #include "MonolithEditorMapActions.h"
+#include "MonolithPieObjectActions.h"
+#include "MonolithPieInputActions.h"
+#include "MonolithPieTimeseries.h"
+#include "MonolithStatActions.h"
 #include "MonolithSettingsCustomization.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
@@ -59,6 +63,20 @@ void FMonolithEditorModule::StartupModule()
 
 	FMonolithEditorActions::RegisterActions(LogCapture);
 	FMonolithEditorMapActions::RegisterActions(FMonolithToolRegistry::Get());  // F8: create_empty_map + get_module_status
+	// Gap 8: live-PIE object property read + function call (editor namespace).
+	FMonolithPieObjectActions::RegisterActions(FMonolithToolRegistry::Get());
+	// Gap 9: time-series PIE sampling with scripted provocation. Implemented in
+	// MonolithEditor (it owns the async PIE-smoke session machinery) but registered
+	// under the "animation" namespace string — the registry is namespace-string-keyed,
+	// not module-keyed (see UnregisterNamespace note in ShutdownModule).
+	FMonolithPieTimeseries::RegisterActions(FMonolithToolRegistry::Get());
+	// Gap 4: deterministic PIE input/control driving (set control rotation with hold,
+	// inject Enhanced Input action, free-fly spectator possess). The held-rotation /
+	// repeated-input re-apply state is dropped on PIE end via the hook below.
+	FMonolithPieInputActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithPieInputActions::RegisterPieEndHook();
+	// Gap 10: programmatic stat-group counter/cycle readout (#if STATS gated).
+	FMonolithStatActions::RegisterActions(FMonolithToolRegistry::Get());
 
 	// Register settings detail customization
 	FPropertyEditorModule& PropModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
@@ -113,6 +131,9 @@ void FMonolithEditorModule::ShutdownModule()
 		PreSlateModalHandle.Reset();
 	}
 #endif
+
+	// Gap 4: drop the PIE-end hook + any residual held-rotation / repeated-input / spectator state.
+	FMonolithPieInputActions::UnregisterPieEndHook();
 
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("editor"));
 
