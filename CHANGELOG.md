@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Optional-plugin detection no longer false-positives on plugins sharing a name prefix** (e.g. `BlueprintRetarget` was wrongly detected as BlueprintAssist, hard-linking an absent module and breaking the user's build). Tightened the disk-presence globs in MonolithBABridge/MonolithGAS/MonolithLogicDriver/MonolithComboGraph from truncated prefixes (`Blueprin*`, `Gameplaya*`, `LogicDri*`, `ComboGra*`) to full plugin names (`BlueprintAssist*`, `GameplayAbilities*`, `LogicDriver*`, `ComboGraph*`); the trailing `*` still matches versioned install folders. Reported by @k-s-s (#66).
+
 ## [0.20.3] - 2026-06-20
 
 ### Added
