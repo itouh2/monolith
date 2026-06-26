@@ -6035,7 +6035,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputDI(const TSha
 			bool bHadCurveFields = false;
 			for (const auto& Pair : DIConfig->Values)
 			{
-				if (CurveFieldNames.Contains(Pair.Key)) { bHadCurveFields = true; break; }
+				if (CurveFieldNames.Contains(MonolithKeyToString(Pair.Key))) { bHadCurveFields = true; break; }
 			}
 			if (bHadCurveFields)
 			{
@@ -6067,10 +6067,10 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputDI(const TSha
 
 		for (auto& Pair : DIConfig->Values)
 		{
-			if (bIsCurveDI && CurveKeys.Contains(Pair.Key)) continue;
-			if (bIsGridDI && GridKeys.Contains(Pair.Key)) continue;
+			if (bIsCurveDI && CurveKeys.Contains(MonolithKeyToString(Pair.Key))) continue;
+			if (bIsGridDI && GridKeys.Contains(MonolithKeyToString(Pair.Key))) continue;
 
-			FProperty* Prop = DIUClass->FindPropertyByName(FName(*Pair.Key));
+			FProperty* Prop = DIUClass->FindPropertyByName(FName(*MonolithKeyToString(Pair.Key)));
 			if (!Prop) continue;
 			void* Addr = Prop->ContainerPtrToValuePtr<void>(DIInst);
 			if (FFloatProperty* FP = CastField<FFloatProperty>(Prop)) FP->SetPropertyValue(Addr, static_cast<float>(Pair.Value->AsNumber()));
@@ -10101,8 +10101,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleConfigureDataInterface(cons
 	TArray<TSharedPtr<FJsonValue>> PropsFailed;
 	for (auto& Pair : Properties->Values)
 	{
-		FProperty* Prop = DI->GetClass()->FindPropertyByName(FName(*Pair.Key));
-		if (!Prop) { PropsNotFound.Add(Pair.Key); continue; }
+		FProperty* Prop = DI->GetClass()->FindPropertyByName(FName(*MonolithKeyToString(Pair.Key)));
+		if (!Prop) { PropsNotFound.Add(MonolithKeyToString(Pair.Key)); continue; }
 		void* Addr = Prop->ContainerPtrToValuePtr<void>(DI);
 
 		// Build value string — handle JSON arrays → UE array syntax, JSON objects → UE struct syntax
@@ -10138,7 +10138,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleConfigureDataInterface(cons
 				{
 					if (!bFirst) ValStr += TEXT(",");
 					bFirst = false;
-					ValStr += KV.Key + TEXT("=") + KV.Value->AsString();
+					ValStr += MonolithKeyToString(KV.Key) + TEXT("=") + KV.Value->AsString();
 				}
 				ValStr += TEXT(")");
 			}
@@ -10150,14 +10150,14 @@ FMonolithActionResult FMonolithNiagaraActions::HandleConfigureDataInterface(cons
 
 		if (Prop->ImportText_Direct(*ValStr, Addr, DI, PPF_None))
 		{
-			PropsSet.Add(Pair.Key);
+			PropsSet.Add(MonolithKeyToString(Pair.Key));
 		}
 		else
 		{
 			TSharedRef<FJsonObject> FailEntry = MakeShared<FJsonObject>();
-			FailEntry->SetStringField(TEXT("property"), Pair.Key);
+			FailEntry->SetStringField(TEXT("property"), MonolithKeyToString(Pair.Key));
 			FailEntry->SetStringField(TEXT("value"), ValStr);
-			FailEntry->SetStringField(TEXT("error"), FString::Printf(TEXT("ImportText_Direct failed for property '%s' with value '%s'"), *Pair.Key, *ValStr));
+			FailEntry->SetStringField(TEXT("error"), FString::Printf(TEXT("ImportText_Direct failed for property '%s' with value '%s'"), *MonolithKeyToString(Pair.Key), *ValStr));
 			PropsFailed.Add(MakeShared<FJsonValueObject>(FailEntry));
 		}
 	}
@@ -11803,7 +11803,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetSpawnShape(const TShared
 		for (const auto& Pair : (*ShapeParamsObj)->Values)
 		{
 			// Map friendly param names to module input display names
-			FString InputName = Pair.Key;
+			FString InputName = MonolithKeyToString(Pair.Key);
 			if (InputName == TEXT("radius"))
 			{
 				if      (Shape == TEXT("cylinder")) InputName = TEXT("Cylinder Radius");
@@ -11830,9 +11830,9 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetSpawnShape(const TShared
 
 			FMonolithActionResult SetResult = HandleSetModuleInputValue(SetParams);
 			if (SetResult.bSuccess)
-				ParamsSet.Add(Pair.Key);
+				ParamsSet.Add(MonolithKeyToString(Pair.Key));
 			else
-				Warnings.Add(FString::Printf(TEXT("Failed to set param '%s': %s"), *Pair.Key, *SetResult.ErrorMessage));
+				Warnings.Add(FString::Printf(TEXT("Failed to set param '%s': %s"), *MonolithKeyToString(Pair.Key), *SetResult.ErrorMessage));
 		}
 	}
 
@@ -14660,8 +14660,8 @@ static TSharedRef<FJsonObject> DiffJsonObjects(const TSharedPtr<FJsonObject>& A,
 
 	// Collect all keys from both
 	TSet<FString> AllKeys;
-	for (auto& Pair : A->Values) AllKeys.Add(Pair.Key);
-	for (auto& Pair : B->Values) AllKeys.Add(Pair.Key);
+	for (auto& Pair : A->Values) AllKeys.Add(MonolithKeyToString(Pair.Key));
+	for (auto& Pair : B->Values) AllKeys.Add(MonolithKeyToString(Pair.Key));
 
 	TArray<TSharedPtr<FJsonValue>> Changes;
 	for (const FString& Key : AllKeys)

@@ -116,4 +116,4 @@ The index covers these types for `find_by_type`:
 - Combine with domain-specific tools: search first, then inspect with `blueprint_query`, `material_query`, etc.
 - `get_stats` shows last index time — if stale, trigger `monolith_reindex()`
 - RI reflection tables refresh on Live Coding / lazy first-call; force a project-only rebuild with `reflect_query("rebuild_reflection_index")`
-- Call `monolith_discover('namespace')` to see required/optional params for every action
+- Call `monolith_discover('namespace')` to list action names + one-line descriptions (terse by default). For an action's full param schema, call `describe_query action_schema` (or pass `detail=true` to inline all schemas)

@@ -6,7 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-06-20
+
 ### Added
+
+- **UE 5.7 + 5.8 cross-engine releases.** Monolith now ships one flat per-engine zip per supported Unreal version: `Monolith-vX.Y.Z-UE5.7.zip` and `Monolith-vX.Y.Z-UE5.8.zip`. Download the zip matching your engine -- the plugin loads with no compiler, and the same source builds and runs on both 5.7 and 5.8.
+- **Engine-aware auto-updater.** The updater detects the running engine (compile-time `ENGINE_MINOR_VERSION`) and fetches the matching release asset, verified by a per-engine `Monolith-SHA256-UE5.x:` marker; it fails closed if no build exists for your engine. Updating from a pre-cross-engine release falls back to the legacy single-zip path.
+
+- **Terse-by-default `monolith_discover(namespace)`.** The per-namespace branch now returns each action's name + a one-line description only — the full per-action `params` JSON-Schema is no longer emitted by default. Fetch a single action's schema with `describe_query action_schema` (~54 tokens), or pass `detail=true` (alias `verbose=true`) to inline every action's schema (reproduces the pre-change response shape byte-for-byte). New optional params: `filter` (case-insensitive substring on action name OR full description) and opt-in `offset`/`limit` pagination (`limit=0` = the complete list; no action is hidden by default). Terse responses carry top-level `total` (always), `next_offset` (only when a positive `limit` leaves more), and `schema_hint` (points callers at `describe_query action_schema` / `detail=true`). The one-line description is trimmed to its first sentence, else hard-capped at 150 chars on a word boundary with a trailing `"..."`; the full description is preserved in `detail` mode and via `describe_query action_schema`. The full `discover()` (no namespace) response is unchanged. Measured per-namespace token reduction (terse vs `detail`, same-server baseline):
+
+  | namespace | detail (baseline) | terse | reduction |
+  |-----------|-------------------|-------|-----------|
+  | blueprint | 24,521 | 4,027 | 83.6% |
+  | animation | 36,236 | 6,682 | 81.6% |
+  | ui | 20,590 | 4,944 | 76.0% |
+  | ai | 20,157 | 5,588 | 72.3% |
+
+- **Surgical nested-path UPROPERTY writer (`blueprint`) — `set_property_at_path`.** Sets a single value deep inside a CDO / UObject asset addressed by a dotted+bracket path — `Standing.Gaits[Jog].Starts.Forward` (`.` = struct member, `[N]` = array index, `[Key]` = map key, the key imported through the map's key grammar so enum names / ints / FName / string keys all resolve). Unlike `set_cdo_properties` (which rebuilds whole arrays/maps from a JSON tree) the write is in place, leaving sibling elements / keys untouched. Leaf values accept scalars, enum names, ImportText struct literals, hard object refs, and `TSoftObjectPtr` asset paths, identical to `set_cdo_property`. The write goes through the engine edit cradle (FProperty reflection, not the editor's edit-flag gate), so it writes `EditDefaultsOnly` DataAsset fields the editor refuses on saved instances. `create_missing_keys` adds an absent map key; `dry_run` resolves + validates without mutating; `save` persists the package to disk. Backed by a new generic `FMonolithReflectionWalker::ResolvePath` path resolver in `MonolithCore`.
+
+- **Retarget pose + op-stack tuning (`animation`) — 8 new actions.** Author the IK Retargeter retarget pose and the per-chain / root / foot-lock op settings, plus per-bone `USkeleton` translation-retargeting, so a retarget can be dialed in rather than left at op-stack defaults.
+  - `align_retarget_pose` — auto-align an IK Retargeter's source or target retarget pose via AutoAlign + SnapBoneToGround.
+  - `get_retarget_pose` / `set_retarget_pose` — read/edit a retarget pose. `set_retarget_pose` `mode`: `from_reference` (reset to the rig reference pose) or `bone_deltas` (apply per-bone rotation/translation offsets); a `from_animation` mode is deferred.
+  - `get_retarget_chain_settings` / `set_retarget_chain_settings` — read/write a retarget chain's FK and IK op-stack settings (rotation/translation modes, IK blend, etc.), written reflectively.
+  - `set_retarget_root_settings` — set the Pelvis Motion op settings: vertical scale, floor constraint, and whether root motion affects the IK goals.
+  - `enable_foot_ground_lock` — configure the Speed Planting op's foot ground-lock on named IK chains.
+  - `set_bone_translation_retargeting` / `get_bone_translation_retargeting` — read/write per-bone `USkeleton` translation-retargeting modes (`Animation` / `Skeleton` / `AnimationScaled` / `AnimationRelative` / `OrientAndScale`); the setter also accepts a `biped_locomotion` preset.
+
+- **Locomotion authoring (`animation`) — 3 new actions.**
+  - `get_root_motion_speed` — report a sequence's authored root-motion ground speed in cm/s, with an explicit "unknowable" signal for root-locked or no-root-motion clips instead of a misleading zero.
+  - `bake_distance_curve` — bake a `Distance` curve onto a sequence via the engine `DistanceCurveModifier` (removes any existing same-named curve first, then persists the baked curve into the asset's modifier stack).
+  - `bind_threadsafe_update_function` — wire a Blueprint-library static call into an AnimBP's `BlueprintThreadSafeUpdateAnimation` graph (v1a: known-signature binding).
+
+- **IK Rig bone settings (`animation`) — 2 new actions.** `set_ik_rig_bone_settings` / `get_ik_rig_bone_settings` — write/read a bone's per-solver IK Rig bone settings, addressed reflectively so solver-specific fields are reachable.
+
+- **Bone transform inspection (`animation`).** `get_animated_bone_transform` — the FK-composed transform of a bone at a given frame or time, in component space or world space.
+
+### Changed
+
+- **`get_retargeter_info` (`animation`)** now emits an `ops[]` array — per retarget op its type plus reflected settings — alongside the existing chain mappings.
+- **`apply_anim_modifier` (`animation`)** now accepts a `properties` object (a reflective field set written onto the modifier before it runs) and a `persist` flag (register the modifier into the asset's `AnimationModifiers` stack so it survives reimport, rather than a one-shot run).
+- **`get_blend_space_info` (`animation`)** now reports each sample's authored root-motion speed plus the `triangulation_baked` and `interpolate_using_grid` flags.
+- **`get_anim_node_pin_bindings` (`animation`)** now also emits wire-linked input pins (`type:"Link"` entries carrying the source node/pin driving the input), so property-access bindings and graph wires on a node are both visible in one read.
+- **`derive_foot_sync_markers` (`animation`)** gains a `from_bones` mode that derives foot plants from per-frame foot-bone height plus planar-speed minima, for clips with no markers/notifies/curves but a usable foot-bone track.
+- **`get_curve_keys` (`animation`)** now reports `monotonic` and `sign` flags on the returned curve.
+- **`set_anim_node_function_binding` (`animation`)** now calls `RequestRefreshExtensions` so the recompile regenerates the anim-subsystem set for the changed binding — without it the changed binding left a null `NodeRelevancy` subsystem at runtime.
 
 ### Fixed
 

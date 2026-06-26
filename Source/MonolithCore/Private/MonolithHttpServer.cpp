@@ -481,7 +481,8 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleInitialize(const TSharedPtr<F
 		TEXT("Monolith MCP server for Unreal Engine. ")
 		TEXT("Before calling a domain action, check its schema instead of guessing: ")
 		TEXT("monolith_discover() lists namespaces, monolith_discover('<namespace>') lists a ")
-		TEXT("namespace's actions, and describe_query('action_schema', ...) returns an action's ")
+		TEXT("namespace's action names + descriptions (terse by default — pass detail=true to ")
+		TEXT("inline param schemas), and describe_query('action_schema', ...) returns one action's ")
 		TEXT("exact parameter schema. monolith_guide(section='recipes') gives cross-namespace ")
 		TEXT("workflows, decision matrices, and gotchas."));
 
@@ -570,7 +571,7 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsList(const TSharedPtr<FJ
 			}
 
 			const FString Description = FString::Printf(
-				TEXT("Query the %s domain. Call monolith_discover(\"%s\") for the action list."),
+				TEXT("Query the %s domain. Call monolith_discover(\"%s\") for the action list (name + description); pass detail=true or call describe_query action_schema for an action's full param schema."),
 				*Namespace, *Namespace);
 			Tool->SetStringField(TEXT("description"), Description);
 
@@ -592,11 +593,12 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsList(const TSharedPtr<FJ
 			ActionProp->SetArrayField(TEXT("enum"), EnumValues);
 			Properties->SetObjectField(TEXT("action"), ActionProp);
 
-			// "params" property — keep lightweight; full per-action schemas available via monolith_discover
+			// "params" property — keep lightweight; per-action schemas come from
+			// describe_query action_schema (or monolith_discover detail=true).
 			TSharedPtr<FJsonObject> ParamsProp = MakeShared<FJsonObject>();
 			ParamsProp->SetStringField(TEXT("type"), TEXT("object"));
 			ParamsProp->SetStringField(TEXT("description"),
-				FString::Printf(TEXT("Parameters for the action. Call monolith_discover(\"%s\") for full parameter schemas."), *Namespace));
+				FString::Printf(TEXT("Parameters for the action. monolith_discover(\"%s\") is terse by default (name + description); pass detail=true for full param schemas, or call describe_query action_schema for one action."), *Namespace));
 			Properties->SetObjectField(TEXT("params"), ParamsProp);
 
 			InputSchema->SetObjectField(TEXT("properties"), Properties);

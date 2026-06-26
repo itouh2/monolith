@@ -38,6 +38,85 @@ static const TArray<FKnownOptionalModule>& GetKnownOptionalModules()
 	return Modules;
 }
 
+// Trim a (possibly multi-paragraph) registry description down to a single line
+// for TERSE discover output. Detail mode keeps the full description; only the
+// emitted terse field is shortened. The `filter` predicate matches the FULL
+// description, never this trimmed form.
+//
+// Strategy: prefer cutting at the first sentence terminator ('.', '!', '?') at
+// index >= MinSentence that is followed by a space or end-of-string (so we don't
+// cut on "e.g."/"i.e." or on a version like "5.7"/"UK2Node_..."). Fall back to a
+// HardCap, backing up to a word boundary, and append an ASCII "..." suffix. The
+// suffix is three ASCII dots (NOT the Unicode ellipsis U+2026) to keep the source
+// ASCII-only and avoid the project's UTF-8/mojibake release gotcha.
+static FString MonolithTerseOneLineDescription(const FString& Full)
+{
+	const int32 HardCap = 150;
+	const int32 MinSentence = 25;
+
+	const int32 Len = Full.Len();
+
+	// Find the first sentence terminator at index >= MinSentence followed by a
+	// space (or end-of-string). sentenceEnd is the index AFTER the punctuation.
+	int32 SentenceEnd = MAX_int32;
+	for (int32 Index = MinSentence; Index < Len; ++Index)
+	{
+		const TCHAR Ch = Full[Index];
+		if (Ch == TEXT('.') || Ch == TEXT('!') || Ch == TEXT('?'))
+		{
+			const bool bFollowedBySpaceOrEnd = (Index + 1 >= Len) || FChar::IsWhitespace(Full[Index + 1]);
+			if (bFollowedBySpaceOrEnd)
+			{
+				SentenceEnd = Index + 1;
+				break;
+			}
+		}
+	}
+
+	int32 Cut = FMath::Min(SentenceEnd, HardCap);
+
+	// Already short (no sentence break before HardCap and within cap) — return as-is, no suffix.
+	if (Cut >= Len)
+	{
+		return Full;
+	}
+
+	// If the HardCap landed mid-word, back up to the last whitespace before Cut.
+	if (Cut == HardCap && !FChar::IsWhitespace(Full[Cut]))
+	{
+		int32 WordBoundary = Cut;
+		while (WordBoundary > 0 && !FChar::IsWhitespace(Full[WordBoundary - 1]))
+		{
+			--WordBoundary;
+		}
+		if (WordBoundary > 0)
+		{
+			Cut = WordBoundary;
+		}
+	}
+
+	// Strip any trailing whitespace AND sentence-terminator chars before appending
+	// the "..." suffix, so a clean sentence cut ("...graph.") doesn't become four
+	// dots ("...graph...."). Every trimmed description ends in exactly one "...".
+	FString Trimmed = Full.Left(Cut);
+	int32 Tail = Trimmed.Len();
+	while (Tail > 0)
+	{
+		const TCHAR Ch = Trimmed[Tail - 1];
+		if (FChar::IsWhitespace(Ch) || Ch == TEXT('.') || Ch == TEXT('!') || Ch == TEXT('?'))
+		{
+			--Tail;
+		}
+		else
+		{
+			break;
+		}
+	}
+	Trimmed.LeftInline(Tail);
+	Trimmed += TEXT("...");
+	return Trimmed;
+}
+
 void FMonolithCoreTools::RegisterAll()
 {
 	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
@@ -55,9 +134,34 @@ void FMonolithCoreTools::RegisterAll()
 		CatProp->SetStringField(TEXT("description"), TEXT("Optional: filter actions within the namespace by category (e.g. 'CommonUI' inside 'ui')"));
 		Schema->SetObjectField(TEXT("category"), CatProp);
 
+		TSharedPtr<FJsonObject> DetailProp = MakeShared<FJsonObject>();
+		DetailProp->SetStringField(TEXT("type"), TEXT("boolean"));
+		DetailProp->SetStringField(TEXT("description"), TEXT("Optional: inline the full param schema for every action (default false = terse). 'verbose' is an accepted alias. Prefer describe_query action_schema for a single action's schema."));
+		Schema->SetObjectField(TEXT("detail"), DetailProp);
+
+		TSharedPtr<FJsonObject> VerboseProp = MakeShared<FJsonObject>();
+		VerboseProp->SetStringField(TEXT("type"), TEXT("boolean"));
+		VerboseProp->SetStringField(TEXT("description"), TEXT("Alias for detail; inline full param schemas. Prefer detail."));
+		Schema->SetObjectField(TEXT("verbose"), VerboseProp);
+
+		TSharedPtr<FJsonObject> FilterProp = MakeShared<FJsonObject>();
+		FilterProp->SetStringField(TEXT("type"), TEXT("string"));
+		FilterProp->SetStringField(TEXT("description"), TEXT("Optional: case-insensitive substring matched against each action's name or description (applied within the namespace)."));
+		Schema->SetObjectField(TEXT("filter"), FilterProp);
+
+		TSharedPtr<FJsonObject> OffsetProp = MakeShared<FJsonObject>();
+		OffsetProp->SetStringField(TEXT("type"), TEXT("integer"));
+		OffsetProp->SetStringField(TEXT("description"), TEXT("Optional: pagination start index (default 0). Only meaningful when limit > 0."));
+		Schema->SetObjectField(TEXT("offset"), OffsetProp);
+
+		TSharedPtr<FJsonObject> LimitProp = MakeShared<FJsonObject>();
+		LimitProp->SetStringField(TEXT("type"), TEXT("integer"));
+		LimitProp->SetStringField(TEXT("description"), TEXT("Optional: max actions to return (default 0 = ALL — no cap). Pagination is opt-in; with no limit the full action list is returned."));
+		Schema->SetObjectField(TEXT("limit"), LimitProp);
+
 		Registry.RegisterAction(
 			TEXT("monolith"), TEXT("discover"),
-			TEXT("List available tool namespaces and their actions. Pass namespace (and optional category) to filter."),
+			TEXT("List available tool namespaces and their actions. Pass namespace (and optional category) to filter. Per-namespace output is terse by default (action name + description); pass detail=true to inline param schemas, or use describe_query action_schema for one action. Supports filter (substring) and opt-in offset/limit pagination."),
 			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleDiscover),
 			Schema
 		);
@@ -203,28 +307,85 @@ FMonolithActionResult FMonolithCoreTools::HandleDiscover(const TSharedPtr<FJsonO
 			});
 		}
 
+		// Terse-by-default: param schemas are omitted unless detail (canonical) or
+		// verbose (alias) is set. Schemas are fetched lazily via describe_query
+		// action_schema, or inlined for the whole namespace with detail=true.
+		bool bDetail = false;
+		Params->TryGetBoolField(TEXT("detail"), bDetail);          // canonical
+		if (!bDetail)
+		{
+			Params->TryGetBoolField(TEXT("verbose"), bDetail);     // accepted alias
+		}
+
+		// Optional substring filter on action name OR description (case-insensitive).
+		// Applied AFTER the category filter, BEFORE pagination.
+		FString Filter;
+		if (Params->TryGetStringField(TEXT("filter"), Filter) && !Filter.IsEmpty())
+		{
+			Actions = Actions.FilterByPredicate([&Filter](const FMonolithActionInfo& Info)
+			{
+				return Info.Action.Contains(Filter, ESearchCase::IgnoreCase)
+					|| Info.Description.Contains(Filter, ESearchCase::IgnoreCase);
+			});
+		}
+
+		// Pagination is OPT-IN. limit=0 (default) returns ALL post-filter actions so
+		// discoverability never regresses; any limit>0 slices [offset, offset+limit).
+		const int32 TotalCount = Actions.Num();
+		int32 Offset = 0;
+		int32 Limit = 0;
+		Params->TryGetNumberField(TEXT("offset"), Offset);
+		Params->TryGetNumberField(TEXT("limit"), Limit);
+
+		int32 SliceStart = 0;
+		int32 SliceEnd = TotalCount;
+		if (Limit > 0)
+		{
+			SliceStart = FMath::Clamp(Offset, 0, TotalCount);
+			SliceEnd = FMath::Clamp(SliceStart + Limit, SliceStart, TotalCount);
+		}
+
 		Result->SetStringField(TEXT("namespace"), FilterNamespace);
 		if (!FilterCategory.IsEmpty())
 		{
 			Result->SetStringField(TEXT("category"), FilterCategory);
 		}
 		TArray<TSharedPtr<FJsonValue>> ActionArray;
-		for (const FMonolithActionInfo& ActionInfo : Actions)
+		for (int32 Index = SliceStart; Index < SliceEnd; ++Index)
 		{
+			const FMonolithActionInfo& ActionInfo = Actions[Index];
 			TSharedPtr<FJsonObject> ActionObj = MakeShared<FJsonObject>();
 			ActionObj->SetStringField(TEXT("action"), ActionInfo.Action);
-			ActionObj->SetStringField(TEXT("description"), ActionInfo.Description);
+			// Terse mode emits a one-line description; detail mode keeps the full text.
+			ActionObj->SetStringField(TEXT("description"),
+				bDetail ? ActionInfo.Description : MonolithTerseOneLineDescription(ActionInfo.Description));
 			if (!ActionInfo.Category.IsEmpty())
 			{
 				ActionObj->SetStringField(TEXT("category"), ActionInfo.Category);
 			}
-			if (ActionInfo.ParamSchema.IsValid())
+			if (bDetail && ActionInfo.ParamSchema.IsValid())
 			{
 				ActionObj->SetObjectField(TEXT("params"), ActionInfo.ParamSchema);
 			}
 			ActionArray.Add(MakeShared<FJsonValueObject>(ActionObj));
 		}
 		Result->SetArrayField(TEXT("actions"), ActionArray);
+
+		// Always report the post-filter count (pre-slice). next_offset is emitted
+		// only when a positive limit was supplied AND more actions remain.
+		Result->SetNumberField(TEXT("total"), TotalCount);
+		if (Limit > 0 && SliceEnd < TotalCount)
+		{
+			Result->SetNumberField(TEXT("next_offset"), SliceStart + Limit);
+		}
+
+		// Terse-only hint: tells the agent where to get the param schema it dropped.
+		if (!bDetail)
+		{
+			Result->SetStringField(TEXT("schema_hint"),
+				FString::Printf(TEXT("Param schemas omitted. Call describe_query(action_schema, target_namespace=\"%s\", target_action=\"<name>\") for one action's full schema, or pass detail=true to inline all."),
+					*FilterNamespace));
+		}
 	}
 	else
 	{
